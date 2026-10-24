@@ -39,10 +39,23 @@ void mpuWrite(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
 }
 
+uint8_t mpuRead(uint8_t reg) {
+  Wire.beginTransmission(MPU);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
 void setup() {
   Serial.begin(500000);
   Wire.begin();
   Wire.setClock(400000);                  // fast I2C
+  Wire.setWireTimeout(3000, true);        // a bad wire or motor noise must not freeze the loop
+  while (mpuRead(0x75) == 0xFF) {         // WHO_AM_I: no answer means no sensor (clones reply 0x68, 0x70, 0x72...)
+    Serial.println("ERROR: MPU6050 not found - check VCC, GND, SDA->A4, SCL->A5");
+    delay(1000);
+  }
   mpuWrite(0x6B, 0x00);                   // wake up
   mpuWrite(0x1A, 0x01);                   // low-pass filter ~184 Hz, 1 kHz internal rate
   mpuWrite(0x1C, 0x08);                   // accel range +/-4 g (8192 counts per g)
@@ -83,10 +96,12 @@ void loop() {
   Wire.beginTransmission(MPU);
   Wire.write(0x3B);                       // ACCEL_XOUT_H
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU, (uint8_t)6);
-  int16_t ax = (Wire.read() << 8) | Wire.read();
-  int16_t ay = (Wire.read() << 8) | Wire.read();
-  int16_t az = (Wire.read() << 8) | Wire.read();
+  if (Wire.requestFrom(MPU, (uint8_t)6) != 6) return;   // read failed: skip this sample
+  uint8_t b[6];
+  for (uint8_t i = 0; i < 6; i++) b[i] = Wire.read();   // one at a time: byte order is guaranteed
+  int16_t ax = (b[0] << 8) | b[1];
+  int16_t ay = (b[2] << 8) | b[3];
+  int16_t az = (b[4] << 8) | b[5];
 
   noInterrupts();
   unsigned long p = period, t = lastPulse;
