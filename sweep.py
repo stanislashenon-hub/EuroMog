@@ -26,7 +26,7 @@ import numpy as np
 
 # ---------------- settings ----------------
 SOURCE = "serial"            # "sim" or "serial"
-SERIAL_PORT = "/dev/cu.usbserial-XXXX"
+SERIAL_PORT = "/dev/cu.usbmodem14201"
 BAUD = 500000
 FS = 1000                 # must match the Arduino
 F_MIN, F_MAX = 5, 200     # where we look for the rotation peak, Hz
