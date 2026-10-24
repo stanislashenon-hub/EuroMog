@@ -52,7 +52,7 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);                  // fast I2C
   Wire.setWireTimeout(3000, true);        // a bad wire or motor noise must not freeze the loop
-  while (mpuRead(0x75) != 0x68) {         // WHO_AM_I: is the sensor there?
+  while (mpuRead(0x75) == 0xFF) {         // WHO_AM_I: no answer means no sensor (clones reply 0x68, 0x70, 0x72...)
     Serial.println("ERROR: MPU6050 not found - check VCC, GND, SDA->A4, SCL->A5");
     delay(1000);
   }
