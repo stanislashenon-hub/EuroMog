@@ -13,6 +13,8 @@ Run:
   python3 sweep.py          sweep up then down with a live plot, save CSV + plot in logs/
                             and the result in rig_profile.json (read by the monitor and agent)
   python3 sweep.py tap      motor off: tap the plank, prints its natural frequency
+  python3 sweep.py profile logs/sweep_<time>.csv
+                            rebuild rig_profile.json from an earlier real-rig sweep
 
 Close vibe_monitor.py first: only one program can hold the serial port.
 Ctrl-C stops the motor.
@@ -234,9 +236,9 @@ def analyse(points):
     return res
 
 
-def write_profile(points, res):
+def write_profile(points, res, real=None):
     """Measured resonance for the monitor and the agent. Only the real rig writes it."""
-    if SOURCE != "serial":
+    if not (SOURCE == "serial" if real is None else real):
         print("Simulator run: %s not updated." % os.path.basename(PROFILE))
         return
     profile = {
@@ -296,7 +298,22 @@ def tap_test(src):
     print("Natural frequency ~ %.1f Hz = %.0f RPM" % (fn, fn * 60))
 
 
+def profile_from_csv(path):
+    """Re-analyse a saved sweep (no hardware needed) and write rig_profile.json from it."""
+    points = []
+    with open(path) as f:
+        keys = f.readline().strip().split(",")
+        for line in f:
+            row = dict(zip(keys, line.strip().split(",")))
+            points.append({"dir": row["dir"], "duty": int(row["duty"]),
+                           **{k: float(row[k]) for k in ("rpm", "f1", "a1", "rms")}})
+    write_profile(points, analyse(points), real=True)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["profile"]:
+        profile_from_csv(sys.argv[2])
+        sys.exit()
     src = SimSource() if SOURCE == "sim" else SerialSource()
     try:
         if sys.argv[1:] == ["tap"]:
