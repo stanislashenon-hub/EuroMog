@@ -11,13 +11,17 @@ imbalance stays high at every speed, resonance goes away when you move off the b
 
 Run:
   python3 sweep.py          sweep up then down with a live plot, save CSV + plot in logs/
+                            and the result in rig_profile.json (read by the monitor and agent)
   python3 sweep.py tap      motor off: tap the plank, prints its natural frequency
+  python3 sweep.py profile logs/sweep_<time>.csv
+                            rebuild rig_profile.json from an earlier real-rig sweep
 
 Close vibe_monitor.py first: only one program can hold the serial port.
 Ctrl-C stops the motor.
 """
 
 import datetime
+import json
 import os
 import sys
 import time
@@ -41,6 +45,7 @@ LIVE = True               # live plot during the sweep
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+PROFILE = os.path.join(HERE, "rig_profile.json")   # commit it: the rig's measured resonance
 
 
 # ---------------- data sources ----------------
@@ -231,7 +236,26 @@ def analyse(points):
     return res
 
 
+def write_profile(points, res, real=None):
+    """Measured resonance for the monitor and the agent. Only the real rig writes it."""
+    if not (SOURCE == "serial" if real is None else real):
+        print("Simulator run: %s not updated." % os.path.basename(PROFILE))
+        return
+    profile = {
+        "measured": datetime.datetime.now().isoformat(timespec="seconds"),
+        "duty_range": [DUTY_START, DUTY_STOP],
+        "resonance": res,                             # None if no clear peak
+        "curve": [{"dir": p["dir"], "duty": p["duty"], "rpm": round(p["rpm"]),
+                   "norm_ratio": round(p["norm_ratio"], 2)}
+                  for p in points if "norm_ratio" in p],
+    }
+    with open(PROFILE, "w") as f:
+        json.dump(profile, f, indent=2)
+    print("Saved", PROFILE)
+
+
 def save(points, res):
+    write_profile(points, res)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(LOG_DIR, "sweep_%s.csv" % stamp)
     keys = ("dir", "duty", "rpm", "f1", "a1", "rms", "norm_ratio")
@@ -274,7 +298,22 @@ def tap_test(src):
     print("Natural frequency ~ %.1f Hz = %.0f RPM" % (fn, fn * 60))
 
 
+def profile_from_csv(path):
+    """Re-analyse a saved sweep (no hardware needed) and write rig_profile.json from it."""
+    points = []
+    with open(path) as f:
+        keys = f.readline().strip().split(",")
+        for line in f:
+            row = dict(zip(keys, line.strip().split(",")))
+            points.append({"dir": row["dir"], "duty": int(row["duty"]),
+                           **{k: float(row[k]) for k in ("rpm", "f1", "a1", "rms")}})
+    write_profile(points, analyse(points), real=True)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["profile"]:
+        profile_from_csv(sys.argv[2])
+        sys.exit()
     src = SimSource() if SOURCE == "sim" else SerialSource()
     try:
         if sys.argv[1:] == ["tap"]:
