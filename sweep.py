@@ -10,7 +10,7 @@ speed band. That is how the agent will tell "resonance" from "imbalance":
 imbalance stays high at every speed, resonance goes away when you move off the band.
 
 Run:
-  python3 sweep.py          sweep up then down, save CSV + plot in logs/
+  python3 sweep.py          sweep up then down with a live plot, save CSV + plot in logs/
   python3 sweep.py tap      motor off: tap the plank, prints its natural frequency
 
 Close vibe_monitor.py first: only one program can hold the serial port.
@@ -36,6 +36,7 @@ SETTLE_S = 2.0            # motor reaches its new speed
 MEASURE_S = 2.0           # samples per point -> resolution 1/MEASURE_S Hz
 ABORT_RMS_G = 1.5         # stop the sweep if the rig shakes this hard (sensor is +/-4 g)
 PEAK_FACTOR = 2.0         # resonance band: normalised 1x above PEAK_FACTOR x the median
+LIVE = True               # live plot during the sweep
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
@@ -97,13 +98,73 @@ class SerialSource:
         return np.array(out)
 
 
+# ---------------- live plot ----------------
+class Live:
+    """Top: spectrum of the last second, refreshed while the motor runs.
+    Bottom: the sweep curve, one point per speed, as it is measured."""
+
+    def __init__(self):
+        import matplotlib.pyplot as plt
+        self.plt = plt
+        plt.ion()
+        self.fig, (self.ax_f, self.ax_s) = plt.subplots(2, 1, figsize=(9, 7))
+        self.buf = np.zeros(FS)
+        self.line_f, = self.ax_f.plot(np.fft.rfftfreq(FS, 1 / FS), np.zeros(FS // 2 + 1), lw=1)
+        self.ax_f.set_xlim(0, F_MAX)
+        self.ax_f.set_xlabel("frequency (Hz)")
+        self.ax_f.set_ylabel("amplitude (g)")
+        self.up, = self.ax_s.plot([], [], "o-", label="up")
+        self.down, = self.ax_s.plot([], [], "s--", label="down")
+        self.ax_s.axhline(PEAK_FACTOR, color="gray", ls=":")
+        self.ax_s.set_xlabel("RPM")
+        self.ax_s.set_ylabel("1x / speed^2 (x median so far)")
+        self.ax_s.legend(loc="upper right")
+        self.ax_f.set_title("starting...")            # reserve room for the title
+        self.fig.tight_layout()
+        self.ymax, self.t_draw = 0.05, 0.0
+
+    def feed(self, x):
+        """New samples: roll them into the 1 s buffer, redraw the spectrum 5x per second."""
+        if len(x):
+            x = x[-FS:]
+            self.buf = np.roll(self.buf, -len(x))
+            self.buf[-len(x):] = x
+        if time.time() - self.t_draw > 0.2:
+            spec = spectrum(self.buf)[1]
+            self.ymax = max(0.05, 0.98 * self.ymax, 1.2 * spec[1:].max())
+            self.line_f.set_ydata(spec)
+            self.ax_f.set_ylim(0, self.ymax)
+            self.t_draw = time.time()
+        self.plt.pause(0.02)
+
+    def add_point(self, points):
+        p = points[-1]
+        self.ax_f.set_title("%s  duty %d  %.0f RPM  1x %.3f g  rms %.3f g"
+                            % (p["dir"], p["duty"], p["rpm"], p["a1"], p["rms"]))
+        pts = [q for q in points if q["f1"] > F_MIN]
+        if not pts:
+            return
+        med = np.median([q["a1"] / q["f1"] ** 2 for q in pts])
+        for line, direction in ((self.up, "up"), (self.down, "down")):
+            ps = [q for q in pts if q["dir"] == direction]
+            line.set_data([q["rpm"] for q in ps], [q["a1"] / q["f1"] ** 2 / med for q in ps])
+        self.ax_s.relim()
+        self.ax_s.autoscale_view()
+
+
+live = None
+
+
 # ---------------- measurement ----------------
 def record(src, seconds):
     """Collect exactly seconds * FS samples."""
     n, chunks = int(seconds * FS), []
     while sum(len(c) for c in chunks) < n:
         chunks.append(src.read())
-        time.sleep(0.02)
+        if live:
+            live.feed(chunks[-1])                     # also keeps the window responsive
+        else:
+            time.sleep(0.02)
     return np.concatenate(chunks)[:n]
 
 
@@ -139,6 +200,8 @@ def sweep(src):
             points.append(p)
             print("%-4s duty %3d  %6.0f RPM  %5.1f Hz  1x %.3f g  rms %.3f g"
                   % (direction, d, p["rpm"], p["f1"], p["a1"], p["rms"]))
+            if live:
+                live.add_point(points)
             if p["rms"] > ABORT_RMS_G:
                 print("ABORT: rms %.2f g > %.2f g" % (p["rms"], ABORT_RMS_G))
                 return points
@@ -179,6 +242,7 @@ def save(points, res):
     print("Saved", path)
 
     import matplotlib.pyplot as plt
+    plt.ioff()                                        # final plot: block until closed
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
     for direction, style in (("up", "o-"), ("down", "s--")):
         ps = [p for p in points if p["dir"] == direction and "norm_ratio" in p]
@@ -216,6 +280,8 @@ if __name__ == "__main__":
         if sys.argv[1:] == ["tap"]:
             tap_test(src)
         else:
+            if LIVE:
+                live = Live()
             pts = sweep(src)
             src.set_duty(0)
             save(pts, analyse(pts))
