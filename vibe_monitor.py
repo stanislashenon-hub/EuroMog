@@ -35,7 +35,7 @@ from matplotlib.animation import FuncAnimation
 
 # ---------------- settings ----------------
 SOURCE = "sim"            # "sim" or "serial"
-SERIAL_PORT = "/dev/cu.usbserial-XXXX"   # Arduino port (see Arduino IDE > Tools > Port)
+SERIAL_PORT = "/dev/cu.usbmodem14201"   # Arduino port (see Arduino IDE > Tools > Port)
 BAUD = 500000
 FS = 1000                 # sample rate, Hz (must match the Arduino)
 WINDOW_S = 1.0            # FFT window length, s  -> resolution 1/WINDOW_S Hz
