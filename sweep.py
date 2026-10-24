@@ -25,7 +25,7 @@ import time
 import numpy as np
 
 # ---------------- settings ----------------
-SOURCE = "sim"            # "sim" or "serial"
+SOURCE = "serial"            # "sim" or "serial"
 SERIAL_PORT = "/dev/cu.usbserial-XXXX"
 BAUD = 500000
 FS = 1000                 # must match the Arduino
