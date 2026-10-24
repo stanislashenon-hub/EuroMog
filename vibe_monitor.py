@@ -1,27 +1,28 @@
 """
-Cal Hacks 13.0 - Vibration monitor: live FFT + diagnosis + agent link.
+Cal Hacks 13.0 - Vibration monitor: live FFT + diagnosis + investigating agent.
 
-Runs on SIMULATED data now; switch to the real Arduino later by setting
-SOURCE = "serial" and SERIAL_PORT below.
+Run:
+  python3 vibe_monitor.py                                  simulator
+  python3 vibe_monitor.py --serial /dev/cu.usbmodem14201   real rig (Uno)
+  add --no-agent to run without the agent
 
 Keys (click the plot window first):
-  b     capture "healthy" baseline spectrum (do this first, motor running)
+  b     capture "healthy" baseline (motor running, no fault)
   + / - operator speed setpoint up / down (PWM duty +/-20)
   0     operator stop
-  r     reset after a shutdown (back to the operator setpoint)
-  i     toggle imbalance fault   (simulation only)
-  l     toggle looseness fault   (simulation only)
+  v     repair done: the agent verifies the fix and closes the ticket
+  r     reset after a shutdown
+  i / l toggle imbalance / looseness   (simulator only)
+  k     knock on the table             (simulator only)
 
-The agent (agent/agent.py, function decide(report) -> action) is called in the
-background when the diagnosis changes, and every AGENT_PERIOD_S while something
-is wrong. Its action is checked here before touching the motor:
-  - only known modes are accepted
-  - it can only slow the motor down, never above the operator setpoint
-  - a hard vibration limit stops the motor without asking the agent
-
-Run:  python3 vibe_monitor.py
+When an alarm holds for STABLE_S seconds, the agent (agent.py) investigates
+once: it re-measures, sweeps the speed through the Machine interface below
+(which enforces the safety limits) and concludes imbalance / looseness /
+resonance / transient. A hard vibration limit stops the motor without asking
+anyone.
 """
 
+import argparse
 import datetime
 import json
 import os
@@ -33,9 +34,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
+ap = argparse.ArgumentParser()
+ap.add_argument("--serial", metavar="PORT", help="Uno serial port (default: simulator)")
+ap.add_argument("--no-agent", action="store_true", help="monitor only")
+args, _ = ap.parse_known_args()
+
 # ---------------- settings ----------------
-SOURCE = "serial"         # "sim" or "serial"
-SERIAL_PORT = "/dev/cu.usbmodem14201"   # Arduino port (see Arduino IDE > Tools > Port)
+SOURCE = "serial" if args.serial else "sim"
+SERIAL_PORT = args.serial
 BAUD = 500000
 FS = 1000                 # sample rate, Hz (must match the Arduino)
 WINDOW_S = 1.0            # FFT window length, s  -> resolution 1/WINDOW_S Hz
@@ -43,47 +49,54 @@ N = int(FS * WINDOW_S)
 F_MIN, F_MAX = 5, 200     # where we look for the rotation peak, Hz
 
 START_DUTY = 106          # initial operator setpoint (sim: ~1500 RPM)
-MIN_DUTY = 40             # agent may not derate below this (it must shut down instead)
-VIB_LIMIT = 2.0           # vibration (RMS / baseline RMS) the agent should stay under
-ESTOP_RATIO = 8.0         # hard stop, no agent involved
-AGENT_PERIOD_S = 3.0      # re-ask the agent this often while something is wrong
-SETTLE_S = WINDOW_S + 0.8 # after a speed change, wait for motor + FFT window to settle
-STABLE_S = 1.0            # a new diagnosis must hold this long before the agent is asked
-MODES = ("normal", "derate", "hold", "shutdown")
+MIN_DUTY = 40             # the agent may not go below this (it must shut down instead)
+VIB_LIMIT = 2.0           # vibration (RMS / baseline RMS) to stay under
+ESTOP_RATIO = 8.0         # hard stop, nobody asked
+SETTLE_S = WINDOW_S + 0.8 # after a speed change: motor settles + FFT window refills
+STABLE_S = 0.5            # an alarm must hold this long before the agent investigates
+QUIET_S = 3.0             # healthy this long ends an alarm episode
+MODES = ("normal", "derate", "avoid_band", "shutdown")
 MACHINE = "Test rig - DC motor with rotor disk"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# agent.py can sit next to this file, in ./agent/ or in ../agent/
-for p in (HERE, os.path.join(HERE, "agent"), os.path.join(HERE, "..", "agent")):
-    sys.path.insert(0, p)
-try:
-    from agent import decide as agent_decide
-    print("Agent loaded.")
-except ImportError as e:
-    agent_decide = None
-    print("No agent found (%s): monitor only." % e)
+agent = None
+if not args.no_agent:
+    for p in (HERE, os.path.join(HERE, "agent"), os.path.join(HERE, "..", "agent")):
+        sys.path.insert(0, p)
+    try:
+        import agent as agent_module
+        agent = agent_module
+        print("Agent loaded (%s)." % ("Claude" if os.environ.get("ANTHROPIC_API_KEY")
+                                      else "rules; set ANTHROPIC_API_KEY for Claude"))
+    except ImportError as e:
+        print("No agent found (%s): monitor only." % e)
 
 
 # ---------------- data sources ----------------
 class SimSource:
-    """Fake rotor vibration: 1x peak (imbalance), 2x/3x (looseness), noise.
-    Rotor speed follows the PWM duty like a real DC motor would (roughly)."""
+    """Fake rotor vibration: 1x (imbalance), 2x/3x (looseness), a structural
+    resonance at F_RES, knocks, noise. Speed follows PWM duty like a DC motor."""
+    F_RES = 35.0                             # resonance of the simulated plank, Hz
 
     def __init__(self):
         self.duty = 0
         self.f_rot = 0.0
         self.imbalance = False
         self.looseness = False
+        self.knock_left = 0
         self.phase = 0.0
         self.t_last = time.time()
-        self.rpm = 0                         # no Hall sensor in simulation
+        self.rpm = 0
 
     def set_duty(self, duty):
         self.duty = int(max(0, min(255, duty)))
         self.f_rot = 60.0 * self.duty / 255  # 255 duty -> 60 Hz (3600 RPM)
+
+    def knock(self):
+        self.knock_left = 300
 
     def read(self):
         now = time.time()
@@ -93,19 +106,25 @@ class SimSource:
         ph = self.phase + 2 * np.pi * self.f_rot * t
         self.phase = (ph[-1] + 2 * np.pi * self.f_rot / FS) % (2 * np.pi)
 
-        speed_factor = (self.f_rot / 25.0) ** 2      # imbalance force ~ speed^2
-        a1 = (0.25 if self.imbalance else 0.04) * speed_factor
-        k = min(1.0, self.f_rot / 25.0)              # looseness grows with speed too
+        gain = 1 + 3.0 / (1 + ((self.f_rot - self.F_RES) / 2.0) ** 2)   # resonance
+        speed2 = (self.f_rot / 25.0) ** 2
+        a1 = (0.25 if self.imbalance else 0.04) * speed2 * gain
+        k = min(1.0, self.f_rot / 25.0)
         a2 = (0.12 if self.looseness else 0.01) * k
         a3 = (0.08 if self.looseness else 0.005) * k
         x = (a1 * np.sin(ph) + a2 * np.sin(2 * ph + 0.3) + a3 * np.sin(3 * ph + 1.1)
              + 0.02 * np.random.randn(n))
+        if self.knock_left > 0:
+            m = min(n, self.knock_left)
+            j = np.arange(300 - self.knock_left, 300 - self.knock_left + m)
+            x[:m] += 1.5 * np.exp(-j / 80.0) * np.sin(2 * np.pi * 90 * j / FS)
+            self.knock_left -= m
         return x
 
 
 class SerialSource:
     """Reads lines 'ax,ay,az,rpm' (accel in milli-g) from the Uno; uses the z axis.
-    Also sends motor commands: P<0-255> sets PWM duty, S stops."""
+    Sends motor commands: P<0-255> sets PWM duty, S stops."""
 
     def __init__(self):
         import serial
@@ -113,7 +132,7 @@ class SerialSource:
         time.sleep(2)                                 # Uno resets when the port opens
         self.ser.reset_input_buffer()
         self.buf = b""
-        self.rpm = 0                                  # from the Hall sensor (0 if none)
+        self.rpm = 0
         self.duty = 0
 
     def set_duty(self, duty):
@@ -131,7 +150,7 @@ class SerialSource:
                 if len(parts) > 3:
                     self.rpm = float(parts[3])
             except (ValueError, IndexError, UnicodeDecodeError):
-                pass                                  # skip partial/garbled lines
+                pass
         return np.array(out)
 
 
@@ -141,45 +160,36 @@ hann = np.hanning(N)
 
 
 def spectrum(x):
-    """Single-sided amplitude spectrum (same units as x)."""
     x = x - x.mean()
     return 2 * np.abs(np.fft.rfft(x * hann)) / hann.sum()
 
 
 def amp_at(spec, f, tol=1.5):
-    """Peak amplitude within +/- tol Hz of f."""
     m = (freqs > f - tol) & (freqs < f + tol)
     return spec[m].max() if m.any() else 0.0
 
 
 def features(x, spec, hall_rpm=0):
     if hall_rpm > F_MIN * 60:
-        f1 = hall_rpm / 60.0                          # trust the Hall sensor when it reads
+        f1 = hall_rpm / 60.0
     else:
         band = (freqs >= F_MIN) & (freqs <= F_MAX)
-        fpk = freqs[band][np.argmax(spec[band])]      # biggest peak
+        fpk = freqs[band][np.argmax(spec[band])]
         apk = spec[band].max()
         f1 = fpk
-        # The biggest peak can be a harmonic (2x or 3x when the machine is loose).
-        # If there is a real peak at 1/3 or 1/2 of it, that one is the rotation speed.
-        for div in (3, 2):
+        for div in (3, 2):                            # biggest peak may be a harmonic
             if fpk / div >= F_MIN and amp_at(spec, fpk / div) > 0.25 * apk:
                 f1 = fpk / div
                 break
-    return {
-        "f1": float(f1),
-        "rpm": float(f1 * 60),
-        "a1": float(amp_at(spec, f1)),
-        "a2": float(amp_at(spec, 2 * f1)),
-        "a3": float(amp_at(spec, 3 * f1)),
-        "rms": float(np.sqrt(np.mean((x - x.mean()) ** 2))),
-    }
+    return {"f1": float(f1), "rpm": float(f1 * 60),
+            "a1": float(amp_at(spec, f1)), "a2": float(amp_at(spec, 2 * f1)),
+            "a3": float(amp_at(spec, 3 * f1)),
+            "rms": float(np.sqrt(np.mean((x - x.mean()) ** 2)))}
 
 
 def diagnose(feat, base):
-    """Rule-based diagnosis against the healthy baseline.
-    imbalance_ratio is normalised by speed^2 (imbalance force ~ speed^2), so the
-    fault stays visible after derating; vibration_ratio is the raw level."""
+    """imbalance_ratio is normalised by speed^2 so a real imbalance stays visible
+    at any speed; vibration_ratio is the raw level."""
     if base is None:
         return {"status": "NO BASELINE", "faults": [], "imbalance_ratio": 0.0,
                 "looseness_ratio": 0.0, "vibration_ratio": 0.0}
@@ -187,7 +197,6 @@ def diagnose(feat, base):
     r1 = feat["a1"] / max(base["a1"] * speed2, 1e-6)
     harm = (feat["a2"] + feat["a3"]) / max(base["a2"] + base["a3"], 1e-6)
     vib = feat["rms"] / max(base["rms"], 1e-6)
-
     faults = []
     if r1 > 2:
         faults.append("imbalance")
@@ -205,21 +214,34 @@ def diagnose(feat, base):
 
 COLORS = {"HEALTHY": "green", "WARNING": "orange", "CRITICAL": "red", "NO BASELINE": "gray"}
 
-
-# ---------------- state shared with the agent ----------------
+# ---------------- shared state ----------------
 src = SimSource() if SOURCE == "sim" else SerialSource()
+lock = threading.Lock()
 state = {
-    "setpoint": START_DUTY,   # operator's commanded duty
-    "mode": "normal",         # current mode (set by the agent or the safety layer)
-    "latched": False,         # True after a shutdown, until the operator presses r
-    "last_action": None,
-    "agent_busy": False,
-    "last_call": 0.0,
-    "last_key": None,         # (status, faults) at the last agent call
-    "settle_until": 0.0,      # ignore diagnoses until the FFT window has new-speed data only
-    "cand_key": None,         # debounce: diagnosis seen now, and since when
-    "cand_since": 0.0,
+    "setpoint": START_DUTY, "mode": "normal", "latched": False,
+    "settle_until": 0.0,
+    "agent_busy": False, "episode_done": False,
+    "abnormal_since": None, "abnormal_last": 0.0,
+    "open_ticket": None,
+    "agent_line": "",          # last agent message, shown on the plot
 }
+latest = {}
+baseline = None
+baseline_spec = None
+
+
+def now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def log_event(kind, payload):
+    with open(os.path.join(LOG_DIR, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"kind": kind, "time": now_iso(), **payload}) + "\n")
+
+
+def say(msg):
+    print(msg)
+    state["agent_line"] = msg[:110]
 
 
 def set_motor(duty):
@@ -227,139 +249,183 @@ def set_motor(duty):
     if int(duty) != src.duty:
         state["settle_until"] = time.time() + SETTLE_S
     src.set_duty(duty)
-lock = threading.Lock()
-src.set_duty(START_DUTY)
 
 
-def log(kind, payload):
-    with open(os.path.join(LOG_DIR, "events.jsonl"), "a") as f:
-        f.write(json.dumps({"kind": kind, "time": now_iso(), **payload}) + "\n")
-
-
-def now_iso():
-    return datetime.datetime.now().isoformat(timespec="seconds")
-
-
-def make_report(feat, diag, base):
-    hall = getattr(src, "rpm", 0)
+def make_report(feat, diag):
     return {
-        "time": now_iso(),
-        "machine": MACHINE,
-        "rpm": round(feat["rpm"]),
-        "rpm_source": "hall" if hall > F_MIN * 60 else "fft",
-        "duty": src.duty,
-        "setpoint_duty": state["setpoint"],
-        "mode": state["mode"],
-        "status": diag["status"],
-        "faults": diag["faults"],
-        "indicators": {k: diag[k] for k in ("imbalance_ratio", "looseness_ratio", "vibration_ratio")},
-        "features_g": {k: round(feat[k], 4) for k in ("a1", "a2", "a3", "rms")},
-        "baseline": {"rpm": round(base["rpm"]),
-                     **{k + "_g": round(base[k], 4) for k in ("a1", "a2", "a3", "rms")}},
-        "limits": {"min_duty": MIN_DUTY, "max_duty": state["setpoint"],
-                   "vibration_ratio_limit": VIB_LIMIT, "emergency_stop_ratio": ESTOP_RATIO},
-        "allowed_modes": list(MODES),
+        "time": now_iso(), "machine": MACHINE,
+        "rpm": round(feat["rpm"]), "duty": src.duty, "setpoint_duty": state["setpoint"],
+        "mode": state["mode"], "status": diag["status"], "faults": diag["faults"],
+        "imbalance_ratio": diag["imbalance_ratio"], "looseness_ratio": diag["looseness_ratio"],
+        "vibration_ratio": diag["vibration_ratio"],
+        "baseline_rpm": round(baseline["rpm"]) if baseline else None,
     }
 
 
-def apply_action(action, report):
-    """Safety layer: validate the agent's action before it touches the motor."""
+class Machine:
+    """Everything the agent may do to the machine. All of it goes through the
+    safety limits: duty clamped to [MIN_DUTY, operator setpoint], nothing
+    happens after a shutdown until a human resets."""
+
+    def limits(self):
+        return {"min_duty": MIN_DUTY, "max_duty": state["setpoint"],
+                "vibration_ratio_limit": VIB_LIMIT}
+
+    def set_speed(self, duty):
+        with lock:
+            if state["latched"]:
+                return {"ok": False, "error": "machine is shut down; a human must reset it"}
+            d = int(max(MIN_DUTY, min(int(duty), state["setpoint"])))
+            set_motor(d)
+        return {"ok": True, "duty": d, "clamped": d != int(duty)}
+
+    def measure(self):
+        wait = max(state["settle_until"] - time.time(), WINDOW_S + 0.1)  # fully fresh window
+        time.sleep(wait)
+        feat, diag = latest["feat"], latest["diag"]
+        return {"duty": src.duty, "rpm": round(feat["rpm"]), "status": diag["status"],
+                "faults": diag["faults"], "imbalance_ratio": diag["imbalance_ratio"],
+                "looseness_ratio": diag["looseness_ratio"],
+                "vibration_ratio": diag["vibration_ratio"]}
+
+    def speed_sweep(self, duties):
+        out = []
+        for d in list(duties)[:6]:
+            r = self.set_speed(d)
+            if not r["ok"]:
+                out.append(r)
+                break
+            out.append(self.measure())
+        return out
+
+
+machine = Machine()
+
+
+# ---------------- agent orchestration ----------------
+def apply_conclusion(c, report):
     with lock:
         if state["latched"]:
-            return                                    # shut down: only the operator restarts
-        mode = action.get("mode")
-        if mode not in MODES:
-            print("Agent action rejected (unknown mode):", action)
             return
+        mode = c.get("recommended_mode")
+        if mode not in MODES:
+            mode = "derate"
         if mode == "shutdown":
             duty = 0
             state["latched"] = True
         elif mode == "normal":
             duty = state["setpoint"]
-        else:                                         # derate / hold
-            try:
-                duty = int(action.get("target_duty", src.duty))
-            except (TypeError, ValueError):
-                duty = src.duty
-            duty = max(MIN_DUTY, min(duty, state["setpoint"]))   # never above the operator
+        else:
+            duty = int(max(MIN_DUTY, min(int(c.get("recommended_duty", MIN_DUTY)),
+                                         state["setpoint"])))
         state["mode"] = mode
-        state["last_action"] = action
         set_motor(duty)
-    print("AGENT -> %s (duty %d): %s" % (mode.upper(), duty, action.get("reason", "")))
-    log("action", {"action": action, "applied_duty": duty})
-    ticket = action.get("ticket")
-    if ticket:
+    say("AGENT: %s (%s confidence) -> %s, duty %d. %s" % (
+        c.get("diagnosis", "?").upper(), c.get("confidence", "?"), mode, duty,
+        "Technician called." if c.get("needs_technician") else "No technician needed."))
+    print("   evidence:", c.get("evidence", ""))
+    log_event("investigation", {"report": report, "conclusion": c, "applied_duty": duty})
+    t = c.get("ticket")
+    if c.get("needs_technician") and t:
+        ticket = {"id": "T-%s" % datetime.datetime.now().strftime("%H%M%S"), "status": "open",
+                  "opened": now_iso(), "diagnosis": c.get("diagnosis"), **t}
+        state["open_ticket"] = ticket
         with open(os.path.join(LOG_DIR, "tickets.jsonl"), "a") as f:
-            f.write(json.dumps({"time": now_iso(), "report": report, "ticket": ticket}) + "\n")
-        print("\n=== MAINTENANCE TICKET ===\n" + json.dumps(ticket, indent=2) + "\n")
+            f.write(json.dumps(ticket) + "\n")
+        print("\n=== MAINTENANCE TICKET %s ===\n%s\n" % (ticket["id"], json.dumps(t, indent=2)))
 
 
-def run_agent(report):
+def run_investigation(report):
     try:
-        action = agent_decide(report)
-        apply_action(action, report)
-    except Exception as e:                            # agent bugs must never crash the monitor
-        print("Agent error:", e)
+        say("AGENT: alarm (%s %s) - investigating..." % (report["status"],
+                                                      ",".join(report["faults"])))
+        c = agent.investigate(report, machine, log=say)
+        apply_conclusion(c, report)
+    except Exception as e:
+        say("AGENT error: %s" % e)
+    finally:
+        state["agent_busy"] = False
+        state["episode_done"] = True
+
+
+def run_verification():
+    t = state["open_ticket"]
+    try:
+        res = agent.verify(t, machine, log=say)
+        if res["fixed"]:
+            t.update(status="closed", closed=now_iso(), verification=res["evidence"])
+            state["open_ticket"] = None
+            with lock:
+                state["mode"] = "normal"
+                set_motor(state["setpoint"])
+            say("AGENT: repair VERIFIED, ticket %s closed. %s" % (t["id"], res["evidence"]))
+        else:
+            t.update(verification_failed=res["evidence"])
+            say("AGENT: repair NOT confirmed, ticket stays open. %s" % res["evidence"])
+            with lock:
+                set_motor(max(MIN_DUTY, int(state["setpoint"] * 0.6)))
+        with open(os.path.join(LOG_DIR, "tickets.jsonl"), "a") as f:
+            f.write(json.dumps(t) + "\n")
+        log_event("verification", {"ticket": t["id"], "result": res})
+    except Exception as e:
+        say("AGENT error: %s" % e)
     finally:
         state["agent_busy"] = False
 
 
-def maybe_call_agent(feat, diag):
-    if agent_decide is None or baseline is None or state["agent_busy"] or state["latched"]:
+def maybe_investigate(feat, diag):
+    if agent is None or baseline is None or state["agent_busy"] or state["latched"]:
         return
     now = time.time()
     if now < state["settle_until"]:
-        return                                        # FFT window still has old-speed data
-    key = (diag["status"], tuple(diag["faults"]))
-    if key != state["cand_key"]:
-        state.update(cand_key=key, cand_since=now)   # new diagnosis: wait until it is stable
         return
-    if now - state["cand_since"] < STABLE_S:
+    if diag["status"] not in ("WARNING", "CRITICAL"):
+        state["abnormal_since"] = None
+        if now - state["abnormal_last"] > QUIET_S:
+            state["episode_done"] = False
         return
-    changed = key != state["last_key"]
-    abnormal = diag["status"] != "HEALTHY" or state["mode"] != "normal"
-    due = time.time() - state["last_call"] > AGENT_PERIOD_S
-    if changed or (abnormal and due):
-        report = make_report(feat, diag, baseline)
-        log("report", {"report": report})
-        state.update(agent_busy=True, last_call=time.time(), last_key=key)
-        threading.Thread(target=run_agent, args=(report,), daemon=True).start()
+    state["abnormal_last"] = now
+    if state["episode_done"]:
+        return
+    if state["abnormal_since"] is None:
+        state["abnormal_since"] = now
+        return
+    if now - state["abnormal_since"] >= STABLE_S:
+        report = make_report(feat, diag)
+        log_event("alarm", {"report": report})
+        state["agent_busy"] = True
+        threading.Thread(target=run_investigation, args=(report,), daemon=True).start()
 
 
 def safety_check(diag):
-    """Hard limit, independent of the agent."""
     if baseline is not None and diag["vibration_ratio"] > ESTOP_RATIO and not state["latched"]:
         with lock:
             set_motor(0)
             state.update(mode="shutdown", latched=True)
-        print("EMERGENCY STOP: vibration x%.1f above baseline" % diag["vibration_ratio"])
-        log("estop", {"diagnosis": diag})
+        say("EMERGENCY STOP: vibration x%.1f above baseline" % diag["vibration_ratio"])
+        log_event("estop", {"diagnosis": diag})
 
 
 # ---------------- live plot ----------------
 buf = np.zeros(N)
-baseline = None          # dict of features
-baseline_spec = None
+for k in ("keymap.yscale", "keymap.save", "keymap.xscale", "keymap.back", "keymap.forward"):
+    plt.rcParams[k] = []
 
-for k in ("keymap.yscale", "keymap.save", "keymap.xscale"):
-    plt.rcParams[k] = []                              # free up l / s / k for our own keys
-
-fig, (ax_t, ax_f) = plt.subplots(2, 1, figsize=(9, 6))
+fig, (ax_t, ax_f) = plt.subplots(2, 1, figsize=(10, 6.5))
 line_t, = ax_t.plot(np.arange(N) / FS, buf, lw=0.8)
 ax_t.set_xlabel("time (s)")
 ax_t.set_ylabel("accel (g)")
-ax_t.set_ylim(-1, 1)
 line_f, = ax_f.plot(freqs, np.zeros_like(freqs), lw=1, label="live")
 line_b, = ax_f.plot(freqs, np.zeros_like(freqs), lw=1, ls="--", color="gray", label="baseline")
 ax_f.set_xlim(0, F_MAX)
-ax_f.set_ylim(0, 0.4)
 ax_f.set_xlabel("frequency (Hz)")
 ax_f.set_ylabel("amplitude (g)")
 ax_f.legend(loc="upper right")
 status = fig.suptitle("", fontsize=13, fontweight="bold")
-info = ax_f.text(0.01, 0.95, "", transform=ax_f.transAxes, va="top", family="monospace")
+info = ax_f.text(0.01, 0.97, "", transform=ax_f.transAxes, va="top", family="monospace",
+                 fontsize=9)
 fig.tight_layout(rect=(0, 0, 1, 0.95))
-latest = {}
+src.set_duty(START_DUTY)
 
 
 def update(_):
@@ -375,25 +441,36 @@ def update(_):
     latest.update(feat=feat, spec=spec, diag=diag)
 
     safety_check(diag)
-    maybe_call_agent(feat, diag)
+    maybe_investigate(feat, diag)
 
     title = diag["status"]
     if diag["faults"]:
         title += ": " + ", ".join(diag["faults"])
     if baseline is None:
         title += " (press b)"
-    title += "   |   mode: %s, duty %d/%d" % (state["mode"].upper(), src.duty, state["setpoint"])
+    title += "   |   %s, duty %d/%d" % (state["mode"].upper(), src.duty, state["setpoint"])
+    if state["agent_busy"]:
+        title += "   |   AGENT WORKING"
     if state["latched"]:
-        title += "  (press r to reset)"
+        title += "   (press r to reset)"
     status.set_text(title)
     status.set_color(COLORS[diag["status"]])
 
-    line_t.set_ydata(buf - buf.mean())                # remove gravity (~1 g on z)
+    y = buf - buf.mean()
+    line_t.set_ydata(y)
+    ax_t.set_ylim(-max(0.05, 1.3 * np.abs(y).max()), max(0.05, 1.3 * np.abs(y).max()))
     line_f.set_ydata(spec)
+    top = spec[freqs >= F_MIN].max()
+    if baseline_spec is not None:
+        top = max(top, baseline_spec[freqs >= F_MIN].max())
+    ax_f.set_ylim(0, max(0.01, 1.3 * top))
+    ticket = state["open_ticket"]
     info.set_text("RPM %5.0f   1x %.3f g   2x %.3f   3x %.3f   RMS %.3f\n"
-                  "imbalance x%.1f   looseness x%.1f   vibration x%.1f"
+                  "imbalance x%.1f   looseness x%.1f   vibration x%.1f%s\n%s"
                   % (feat["rpm"], feat["a1"], feat["a2"], feat["a3"], feat["rms"],
-                     diag["imbalance_ratio"], diag["looseness_ratio"], diag["vibration_ratio"]))
+                     diag["imbalance_ratio"], diag["looseness_ratio"], diag["vibration_ratio"],
+                     "   |   ticket %s open (press v when repaired)" % ticket["id"] if ticket else "",
+                     state["agent_line"]))
     return line_t, line_f, status, info
 
 
@@ -404,6 +481,7 @@ def on_key(event):
         baseline = dict(latest["feat"])
         baseline_spec = latest["spec"].copy()
         line_b.set_ydata(baseline_spec)
+        state["episode_done"] = False
         print("Baseline captured:", {kk: round(v, 4) for kk, v in baseline.items()})
     elif k in ("+", "=", "-", "0"):
         with lock:
@@ -411,20 +489,29 @@ def on_key(event):
                 state["setpoint"] = 0
             else:
                 state["setpoint"] = max(0, min(255, state["setpoint"] + (20 if k != "-" else -20)))
-            if not state["latched"] and state["mode"] == "normal":
+            if not state["latched"] and state["mode"] == "normal" and not state["agent_busy"]:
                 set_motor(state["setpoint"])
         print("operator setpoint:", state["setpoint"])
     elif k == "r":
         with lock:
-            state.update(latched=False, mode="normal", last_key=None)
+            state.update(latched=False, mode="normal", episode_done=False)
             set_motor(state["setpoint"])
-        print("reset: back to setpoint", state["setpoint"])
+        say("reset: back to setpoint %d" % state["setpoint"])
+    elif k == "v":
+        if agent is None or state["agent_busy"] or not state["open_ticket"]:
+            print("nothing to verify (no open ticket, or the agent is busy)")
+        else:
+            state["agent_busy"] = True
+            threading.Thread(target=run_verification, daemon=True).start()
     elif isinstance(src, SimSource) and k == "i":
         src.imbalance = not src.imbalance
         print("imbalance:", src.imbalance)
     elif isinstance(src, SimSource) and k == "l":
         src.looseness = not src.looseness
         print("looseness:", src.looseness)
+    elif isinstance(src, SimSource) and k == "k":
+        src.knock()
+        print("knock!")
 
 
 if __name__ == "__main__":
