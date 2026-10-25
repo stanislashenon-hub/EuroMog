@@ -225,8 +225,11 @@ def diagnose(feat, base):
         return {"status": "NO BASELINE", "faults": [], "imbalance_ratio": 0.0,
                 "looseness_ratio": 0.0, "vibration_ratio": 0.0}
     speed2 = (max(feat["f1"], 1e-3) / max(base["f1"], 1e-3)) ** 2
-    r1 = feat["a1"] / max(base["a1"] * speed2, 1e-6)
-    harm = (feat["a2"] + feat["a3"]) / max(base["a2"] + base["a3"], 1e-6)
+    # A healthy rotor's 1x peak can sit at the noise floor: never divide by less than a few
+    # times the baseline noise, or tiny readings turn into absurd ratios (x50, x100).
+    noise = base.get("noise", 0.0)
+    r1 = feat["a1"] / max(max(base["a1"], 4 * noise) * speed2, 1e-6)
+    harm = (feat["a2"] + feat["a3"]) / max(base["a2"] + base["a3"], 8 * noise, 1e-6)
     vib = feat["rms"] / max(base["rms"], 1e-6)
     faults = []
     if r1 > 2:
@@ -452,8 +455,11 @@ def apply_conclusion(c, report):
     log_event("investigation", {"report": report, "conclusion": c, "applied_duty": duty})
     t = c.get("ticket")
     if c.get("needs_technician") and t:
-        ticket = {"id": "T-%s" % datetime.datetime.now().strftime("%H%M%S"), "status": "open",
-                  "opened": now_iso(), "diagnosis": c.get("diagnosis"), **t}
+        if state["open_ticket"]:                       # one open ticket at a time: update it
+            ticket = dict(state["open_ticket"], diagnosis=c.get("diagnosis"), updated=now_iso(), **t)
+        else:
+            ticket = {"id": "T-%s" % datetime.datetime.now().strftime("%H%M%S"), "status": "open",
+                      "opened": now_iso(), "diagnosis": c.get("diagnosis"), **t}
         state["open_ticket"] = ticket
         with open(os.path.join(LOG_DIR, "tickets.jsonl"), "a") as f:
             f.write(json.dumps(ticket) + "\n")
@@ -667,6 +673,8 @@ def capture_baseline(who):
     global baseline, baseline_spec
     baseline = dict(latest["feat"])
     baseline_spec = latest["spec"].copy()
+    band = (freqs >= F_MIN) & (freqs <= F_MAX)
+    baseline["noise"] = float(np.median(baseline_spec[band]))    # spectrum noise floor, g
     line_b.set_ydata(baseline_spec)
     state["episode_done"] = False
     state["baseline_info"] = "%s at %s" % (who, datetime.datetime.now().strftime("%H:%M"))

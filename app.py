@@ -120,7 +120,10 @@ left, right = st.columns(2)
 # ---------------- tickets ----------------
 with left:
     st.subheader("Maintenance tickets")
-    open_t = [t for t in tickets.values() if t.get("status") == "open"]
+    # only the ticket the running monitor knows about is open; older ones are history
+    live = (status or {}).get("open_ticket") or {}
+    live_id = live.get("id") if isinstance(live, dict) else None
+    open_t = [t for t in tickets.values() if t.get("status") == "open" and t.get("id") == live_id]
     closed_t = [t for t in tickets.values() if t.get("status") == "closed"]
     if not open_t:
         st.success("No open ticket.")
