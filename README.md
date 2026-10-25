@@ -2,16 +2,28 @@
 
 A rotating machine that tells the difference between a real fault and a false alarm, and only calls a technician when one is needed.
 
-A threshold alarm fires the same way for a knock on the table, an unbalanced rotor or a resonance. Our agent runs experiments on the machine itself (re-measures, sweeps the speed) to find out which one it is:
+## Why an agent, not a few if-statements
+
+The vibration signal alone tells you *that* something changed. It cannot tell you **what to do**, because that depends on things that are not in the signal:
+
+| Context the signal doesn't have | What the agent does with it |
+|---|---|
+| **The operator's constraints** ("order due at 20:00, we need max output") | Measures how vibration grows with speed, runs at the highest safe speed, schedules the repair after the deadline, and **sets its own guard** (stop if vibration passes xN, or at 20:00) that the monitor enforces without asking it |
+| **The technician's repair report** ("I tightened the motor screws") | Checks it against its diagnosis, re-tests the machine, and explains a mismatch ("the problem is rotor imbalance, still x5: rebalance the disk") |
+| **The machine's history** | Spots recurring or worsening faults and raises the severity |
+
+It also runs experiments to tell apart causes that trigger the same alarm:
 
 | What the agent finds | What it does |
 |---|---|
 | Knock on the table (transient) | Nothing: back to normal, no ticket |
-| Imbalance | Slows the motor to a safe speed, opens a maintenance ticket |
-| Looseness | Slows the motor, opens a ticket |
-| Resonance | Changes speed to avoid the band, no technician |
+| Imbalance | Safe speed + plan + guard, maintenance ticket |
+| Looseness | Safe speed + plan + guard, maintenance ticket |
+| Resonance | Avoids that speed band, no technician |
 
-After the repair, the agent re-tests the machine, confirms the fix and closes the ticket.
+After a verified repair, it records the repaired machine as the new healthy baseline.
+
+Claude does the reasoning (tool use: `measure`, `speed_sweep`, `set_speed`, `get_history`, `get_operator_notes`). Without an API key, a rule-based fallback runs the same experiments but ignores the context: a safety net, not the agent.
 
 ## Files
 
@@ -31,6 +43,8 @@ pip install pyserial numpy scipy matplotlib anthropic
 python3 vibe_monitor.py           # real rig if the Uno is plugged in (found automatically), else simulator
 python3 vibe_monitor.py --sim     # force the simulator
 ```
+
+In the dashboard, "Brief the agent" gives it the operator's context, and "Repair done" takes the technician's report.
 
 Keys in the plot window: `b` baseline, `+`/`-` speed, `v` repair done (verify), `r` reset after shutdown. Simulator only: `i` imbalance, `l` looseness, `k` knock.
 

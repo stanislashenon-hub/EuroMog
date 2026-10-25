@@ -87,13 +87,14 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 agent = None
 if not args.no_agent:
-    for p in (HERE, os.path.join(HERE, "agent"), os.path.join(HERE, "..", "agent")):
+    # the agent next to this file wins over any other copy
+    for p in reversed((HERE, os.path.join(HERE, "agent"), os.path.join(HERE, "..", "agent"))):
         sys.path.insert(0, p)
     try:
         import agent as agent_module
         agent = agent_module
-        print("Agent loaded (%s)." % ("Claude" if os.environ.get("ANTHROPIC_API_KEY")
-                                      else "rules; set ANTHROPIC_API_KEY for Claude"))
+        print("Agent loaded from %s (%s)." % (agent.__file__, "Claude" if os.environ.get("ANTHROPIC_API_KEY")
+                                              else "rules; set ANTHROPIC_API_KEY for Claude"))
     except ImportError as e:
         print("No agent found (%s): monitor only." % e)
 
@@ -254,6 +255,11 @@ state = {
     "abnormal_since": None, "abnormal_last": 0.0,
     "open_ticket": None,
     "agent_line": "",          # last agent message, shown on the plot
+    "watch": None,             # guard set by the agent for its plan (enforced in check_watch)
+    "plan": "",                # the agent's current plan, for the operator
+    "pending_note": "",        # what the technician wrote when pressing "Repair done"
+    "rebaseline_at": None,     # after a verified repair: when to record the new healthy state
+    "baseline_info": "",       # who set the baseline, and when
 }
 latest = {}
 baseline = None
@@ -281,6 +287,7 @@ def write_status(feat, diag):
             "vibration_ratio": diag["vibration_ratio"], "baseline": baseline is not None,
             "agent_busy": state["agent_busy"], "agent_line": state["agent_line"],
             "latched": state["latched"], "open_ticket": state["open_ticket"],
+            "watch": state["watch"], "plan": state["plan"], "baseline_info": state["baseline_info"],
             "sensor_restarts": getattr(src, "errors", 0)}
     tmp = STATUS_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -293,7 +300,9 @@ def check_commands():
     if not os.path.exists(COMMAND_FILE):
         return
     try:
-        cmd = json.load(open(COMMAND_FILE)).get("cmd")
+        req = json.load(open(COMMAND_FILE))
+        cmd = req.get("cmd")
+        state["pending_note"] = req.get("note", "") if cmd == "verify" else state["pending_note"]
     except (ValueError, OSError):
         cmd = None
     try:
@@ -341,7 +350,44 @@ class Machine:
 
     def limits(self):
         return {"min_duty": MIN_DUTY, "max_duty": state["setpoint"],
-                "vibration_ratio_limit": VIB_LIMIT}
+                "vibration_ratio_limit": VIB_LIMIT, "emergency_stop_ratio": ESTOP_RATIO}
+
+    def now(self):
+        return datetime.datetime.now().strftime("%H:%M")
+
+    def operator_notes(self, n=5):
+        """What the operator told the agent from the dashboard (logs/notes.jsonl)."""
+        path = os.path.join(LOG_DIR, "notes.jsonl")
+        if not os.path.exists(path):
+            return []
+        notes = [json.loads(l) for l in open(path) if l.strip()]
+        return notes[-n:]
+
+    def history(self, n=10):
+        """Past investigations, repair checks and tickets on this machine."""
+        out = []
+        ev = os.path.join(LOG_DIR, "events.jsonl")
+        if os.path.exists(ev):
+            for line in open(ev):
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("kind") == "investigation":
+                    c = e["conclusion"]
+                    out.append({"time": e["time"], "event": "investigation",
+                                "diagnosis": c.get("diagnosis"), "confidence": c.get("confidence"),
+                                "evidence": str(c.get("evidence", ""))[:250],
+                                "plan": str(c.get("plan", ""))[:200]})
+                elif e.get("kind") == "verification":
+                    r = e["result"]
+                    out.append({"time": e["time"], "event": "repair check", "ticket": e["ticket"],
+                                "fixed": r.get("fixed"), "technician_said": e.get("note", ""),
+                                "evidence": str(r.get("evidence", ""))[:200]})
+                elif e.get("kind") == "guard":
+                    out.append({"time": e["time"], "event": "agent guard triggered",
+                                "reason": e.get("reason")})
+        return out[-n:]
 
     def set_speed(self, duty):
         with lock:
@@ -392,10 +438,17 @@ def apply_conclusion(c, report):
                                          state["setpoint"])))
         state["mode"] = mode
         set_motor(duty)
+        state["watch"] = make_watch(c.get("watch")) if mode != "shutdown" else None
+        state["plan"] = c.get("plan", "")
     say("AGENT: %s (%s confidence) -> %s, duty %d. %s" % (
         c.get("diagnosis", "?").upper(), c.get("confidence", "?"), mode, duty,
         "Technician called." if c.get("needs_technician") else "No technician needed."))
     print("   evidence:", c.get("evidence", ""))
+    print("   plan:", state["plan"])
+    if state["watch"]:
+        w = state["watch"]
+        print("   guard: %s if vibration > x%.1f%s" % (w["then"], w["max_vibration_ratio"],
+                                                   " or at %s" % w["until"] if w.get("until") else ""))
     log_event("investigation", {"report": report, "conclusion": c, "applied_duty": duty})
     t = c.get("ticket")
     if c.get("needs_technician") and t:
@@ -405,6 +458,54 @@ def apply_conclusion(c, report):
         with open(os.path.join(LOG_DIR, "tickets.jsonl"), "a") as f:
             f.write(json.dumps(ticket) + "\n")
         print("\n=== MAINTENANCE TICKET %s ===\n%s\n" % (ticket["id"], json.dumps(t, indent=2)))
+
+
+def make_watch(w):
+    """Validate the guard the agent asked for; the hard limits still apply on top."""
+    if not isinstance(w, dict):
+        return None
+    try:
+        mx = min(float(w.get("max_vibration_ratio", ESTOP_RATIO)), ESTOP_RATIO)
+    except (TypeError, ValueError):
+        return None
+    until, deadline = w.get("until"), None
+    if until:
+        try:
+            hh, mm = [int(x) for x in str(until).split(":")[:2]]
+            d = datetime.datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if d < datetime.datetime.now():
+                d += datetime.timedelta(days=1)
+            deadline = d.timestamp()
+        except (ValueError, TypeError):
+            until = None
+    return {"max_vibration_ratio": round(mx, 2), "until": until, "deadline": deadline,
+            "then": w.get("then") if w.get("then") in ("shutdown", "derate") else "shutdown",
+            "reason": w.get("reason", "")}
+
+
+def check_watch(diag):
+    """Enforce the agent's own guard without asking it (runs every frame)."""
+    w = state["watch"]
+    if not w or state["agent_busy"] or state["latched"] or time.time() < state["settle_until"]:
+        return
+    why = None
+    if diag["vibration_ratio"] > w["max_vibration_ratio"]:
+        why = "vibration x%.1f above the agent's guard x%.1f" % (diag["vibration_ratio"],
+                                                                w["max_vibration_ratio"])
+    elif w.get("deadline") and time.time() >= w["deadline"]:
+        why = "end of the agent's plan (%s)" % w["until"]
+    if not why:
+        return
+    with lock:
+        if w["then"] == "shutdown":
+            set_motor(0)
+            state.update(mode="shutdown", latched=True)
+        else:
+            set_motor(MIN_DUTY)
+            state["mode"] = "derate"
+        state["watch"] = None
+    say("AGENT GUARD: %s -> %s" % (why, w["then"]))
+    log_event("guard", {"reason": why, "action": w["then"], "watch": w})
 
 
 def run_investigation(report):
@@ -422,23 +523,26 @@ def run_investigation(report):
 
 def run_verification():
     t = state["open_ticket"]
+    note, state["pending_note"] = state["pending_note"], ""
     try:
-        res = agent.verify(t, machine, log=say)
+        res = agent.verify(t, machine, log=say, note=note)
+        msg = res.get("message_to_technician") or res.get("evidence", "")
         if res["fixed"]:
-            t.update(status="closed", closed=now_iso(), verification=res["evidence"])
+            t.update(status="closed", closed=now_iso(), verification=msg, technician_note=note)
             state["open_ticket"] = None
             with lock:
-                state["mode"] = "normal"
+                state.update(mode="normal", watch=None, plan="")
                 set_motor(state["setpoint"])
-            say("AGENT: repair VERIFIED, ticket %s closed. %s" % (t["id"], res["evidence"]))
+                state["rebaseline_at"] = state["settle_until"] + 0.3   # record the repaired machine
+            say("AGENT: repair VERIFIED, ticket %s closed. %s" % (t["id"], msg))
         else:
-            t.update(verification_failed=res["evidence"])
-            say("AGENT: repair NOT confirmed, ticket stays open. %s" % res["evidence"])
+            t.update(verification_failed=msg, technician_note=note)
+            say("AGENT: repair NOT confirmed, ticket stays open. %s" % msg)
             with lock:
                 set_motor(max(MIN_DUTY, int(state["setpoint"] * 0.6)))
         with open(os.path.join(LOG_DIR, "tickets.jsonl"), "a") as f:
             f.write(json.dumps(t) + "\n")
-        log_event("verification", {"ticket": t["id"], "result": res})
+        log_event("verification", {"ticket": t["id"], "note": note, "result": res})
     except Exception as e:
         say("AGENT error: %s" % e)
     finally:
@@ -513,7 +617,11 @@ def update(_):
     latest.update(feat=feat, spec=spec, diag=diag)
 
     safety_check(diag)
+    check_watch(diag)
     maybe_investigate(feat, diag)
+    if state["rebaseline_at"] and time.time() >= state["rebaseline_at"]:
+        state["rebaseline_at"] = None
+        capture_baseline("after verified repair")
     write_status(feat, diag)
     check_commands()
 
@@ -555,15 +663,21 @@ def update(_):
     return line_t, line_f, status, info
 
 
-def on_key(event):
+def capture_baseline(who):
     global baseline, baseline_spec
+    baseline = dict(latest["feat"])
+    baseline_spec = latest["spec"].copy()
+    line_b.set_ydata(baseline_spec)
+    state["episode_done"] = False
+    state["baseline_info"] = "%s at %s" % (who, datetime.datetime.now().strftime("%H:%M"))
+    log_event("baseline", {"by": who, "features": baseline})
+    print("Baseline captured (%s):" % who, {kk: round(v, 4) for kk, v in baseline.items()})
+
+
+def on_key(event):
     k = event.key
     if k == "b" and latest:
-        baseline = dict(latest["feat"])
-        baseline_spec = latest["spec"].copy()
-        line_b.set_ydata(baseline_spec)
-        state["episode_done"] = False
-        print("Baseline captured:", {kk: round(v, 4) for kk, v in baseline.items()})
+        capture_baseline("operator")
     elif k in ("+", "=", "-", "0"):
         with lock:
             if k == "0":
@@ -575,12 +689,14 @@ def on_key(event):
         print("operator setpoint:", state["setpoint"])
     elif k == "r":
         with lock:
-            state.update(latched=False, mode="normal", episode_done=False)
+            state.update(latched=False, mode="normal", episode_done=False, watch=None, plan="")
             set_motor(state["setpoint"])
         say("reset: back to setpoint %d" % state["setpoint"])
     elif k == "v":
         if agent is None or state["agent_busy"] or not state["open_ticket"]:
             print("nothing to verify (no open ticket, or the agent is busy)")
+        elif state["latched"]:
+            say("Machine is shut down: reset it (key r) before verifying the repair.")
         else:
             state["agent_busy"] = True
             threading.Thread(target=run_verification, daemon=True).start()
