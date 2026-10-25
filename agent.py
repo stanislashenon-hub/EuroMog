@@ -39,6 +39,8 @@ or if the call fails, the rule-based policy below decides.
 
 import json
 import os
+from ticket_tools import verify_repair, get_ticket_tool_schema
+
 
 MODEL = "claude-haiku-5-5"       # fast; switch to claude-sonnet-5-5 for better tickets
 USE_CLAUDE = True
