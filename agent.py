@@ -34,7 +34,8 @@ verification:
   {"fixed": bool, "matches_diagnosis": bool, "evidence": "...",
    "message_to_technician": "...", "steps": [...], "source": ...}
 
-Claude is used when ANTHROPIC_API_KEY is set (environment or .env). Without it, a
+The model: Gemini when GEMINI_API_KEY (or GOOGLE_API_KEY) is set, Claude when
+ANTHROPIC_API_KEY is set (environment or .env). Without it, a
 rule-based fallback runs the same experiments but ignores operator notes, history
 and the technician's report: it is a safety net, not the agent.
 """
@@ -43,6 +44,7 @@ import json
 import os
 
 MODEL = "claude-sonnet-5-5"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 MAX_ROUNDS = 10
 
 
@@ -240,6 +242,81 @@ def _claude_loop(system, user_payload, tools, finish_name, machine, log):
     raise RuntimeError("no conclusion after %d rounds" % MAX_ROUNDS)
 
 
+def _gemini_schema(s):
+    """Anthropic-style JSON schema -> the subset Gemini function declarations accept."""
+    if isinstance(s, dict):
+        if "anyOf" in s:                                   # {anyOf: [X, null]} -> X (optional)
+            branches = [b for b in s["anyOf"] if b.get("type") != "null"]
+            out = _gemini_schema(branches[0]) if branches else {"type": "string"}
+            for k in ("description",):
+                if k in s:
+                    out[k] = s[k]
+            return out
+        out = {k: _gemini_schema(v) for k, v in s.items() if k not in ("additionalProperties",)}
+        if out.get("type") == "object" and "properties" in out and not out["properties"]:
+            out.pop("properties")
+        return out
+    if isinstance(s, list):
+        return [_gemini_schema(x) for x in s]
+    return s
+
+
+def _gemini_loop(system, user_payload, tools, finish_name, machine, log):
+    from google import genai
+    from google.genai import types
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    client = genai.Client(api_key=key)
+    decls = []
+    for t in tools:
+        params = _gemini_schema(t["input_schema"])
+        if params.get("properties"):
+            decls.append(types.FunctionDeclaration(name=t["name"], description=t["description"],
+                                                   parameters=params))
+        else:
+            decls.append(types.FunctionDeclaration(name=t["name"], description=t["description"]))
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        tools=[types.Tool(function_declarations=decls)],
+        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        temperature=0.2)
+    contents = [types.Content(role="user", parts=[types.Part(text=json.dumps(user_payload, default=str))])]
+    steps = []
+    for _ in range(MAX_ROUNDS):
+        resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+        cand = resp.candidates[0].content
+        contents.append(cand)
+        calls = [p.function_call for p in (cand.parts or []) if getattr(p, "function_call", None)]
+        if not calls:
+            raise RuntimeError("model answered without calling a tool")
+        replies = []
+        for fc in calls:
+            args = dict(fc.args or {})
+            if fc.name == finish_name:
+                out = json.loads(json.dumps(args, default=str))     # plain dicts/lists
+                out["steps"] = steps
+                return out
+            log("agent -> %s %s" % (fc.name, json.dumps(args, default=str)))
+            result = _run_tool(fc.name, args, machine)
+            steps.append({"tool": fc.name, "input": args, "result": result})
+            replies.append(types.Part.from_function_response(
+                name=fc.name, response={"result": json.loads(json.dumps(result, default=str))}))
+        contents.append(types.Content(role="user", parts=replies))
+    raise RuntimeError("no conclusion after %d rounds" % MAX_ROUNDS)
+
+
+def _provider():
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        return "gemini"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "claude"
+    return None
+
+
+def _llm_loop(*a):
+    return _gemini_loop(*a) if _provider() == "gemini" else _claude_loop(*a)
+
+
 # ---------------- rule-based fallback (no context: a safety net, not the agent) ----------------
 def rule_investigate(report, machine, log):
     lim = machine.limits()
@@ -338,34 +415,34 @@ def rule_verify(ticket, machine, log, note):
 
 # ---------------- entry points used by the monitor ----------------
 def investigate(report, machine, log=print):
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    if _provider():
         try:
             tools = COMMON_TOOLS + [s for s, _ in EXTRA_TOOLS.values()] + [FINISH]
-            out = _claude_loop(SYSTEM_INVESTIGATE,
-                               {"alarm_report": report, "limits": machine.limits(),
-                                "now": machine.now()},
-                               tools, "finish", machine, log)
-            out["source"] = "claude"
+            out = _llm_loop(SYSTEM_INVESTIGATE,
+                            {"alarm_report": report, "limits": machine.limits(),
+                             "now": machine.now()},
+                            tools, "finish", machine, log)
+            out["source"] = _provider()
             return out
         except Exception as e:
-            log("Claude investigation failed (%s), using rules" % e)
+            log("%s investigation failed (%s), using rules" % (_provider(), e))
     out = rule_investigate(report, machine, log)
     out["source"] = "rules"
     return out
 
 
 def verify(ticket, machine, log=print, note=""):
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    if _provider():
         try:
             tools = [t for t in COMMON_TOOLS if t["name"] != "get_operator_notes"] + [FINISH_VERIFY]
-            out = _claude_loop(SYSTEM_VERIFY,
-                               {"ticket": ticket, "technician_says": note or "(nothing written)",
-                                "limits": machine.limits()},
-                               tools, "finish_verification", machine, log)
-            out["source"] = "claude"
+            out = _llm_loop(SYSTEM_VERIFY,
+                            {"ticket": ticket, "technician_says": note or "(nothing written)",
+                             "limits": machine.limits()},
+                            tools, "finish_verification", machine, log)
+            out["source"] = _provider()
             return out
         except Exception as e:
-            log("Claude verification failed (%s), using rules" % e)
+            log("%s verification failed (%s), using rules" % (_provider(), e))
     out = rule_verify(ticket, machine, log, note)
     out["source"] = "rules"
     return out

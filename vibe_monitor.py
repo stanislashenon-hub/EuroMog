@@ -93,8 +93,8 @@ if not args.no_agent:
     try:
         import agent as agent_module
         agent = agent_module
-        print("Agent loaded from %s (%s)." % (agent.__file__, "Claude" if os.environ.get("ANTHROPIC_API_KEY")
-                                              else "rules; set ANTHROPIC_API_KEY for Claude"))
+        print("Agent loaded from %s (%s)." % (agent.__file__, agent._provider() or
+                                              "rules only: no API key found in .env"))
     except ImportError as e:
         print("No agent found (%s): monitor only." % e)
 

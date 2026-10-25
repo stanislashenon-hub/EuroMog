@@ -23,7 +23,7 @@ It also runs experiments to tell apart causes that trigger the same alarm:
 
 After a verified repair, it records the repaired machine as the new healthy baseline.
 
-Claude does the reasoning (tool use: `measure`, `speed_sweep`, `set_speed`, `get_history`, `get_operator_notes`). Without an API key, a rule-based fallback runs the same experiments but ignores the context: a safety net, not the agent.
+The model (Gemini or Claude, whichever key is in `.env`) does the reasoning (tool use: `measure`, `speed_sweep`, `set_speed`, `get_history`, `get_operator_notes`). Without an API key, a rule-based fallback runs the same experiments but ignores the context: a safety net, not the agent.
 
 ## Files
 
@@ -39,7 +39,7 @@ Claude does the reasoning (tool use: `measure`, `speed_sweep`, `set_speed`, `get
 ## Run
 
 ```bash
-pip install pyserial numpy scipy matplotlib anthropic
+pip install pyserial numpy scipy matplotlib anthropic google-genai streamlit
 python3 vibe_monitor.py           # real rig if the Uno is plugged in (found automatically), else simulator
 python3 vibe_monitor.py --sim     # force the simulator
 ```
@@ -55,7 +55,7 @@ pip install streamlit
 streamlit run app.py
 ```
 
-To use Claude, put `ANTHROPIC_API_KEY=...` in a `.env` file next to `agent.py`. Never commit it.
+Model: put `GEMINI_API_KEY=...` (or `ANTHROPIC_API_KEY=...`) in a `.env` file next to `agent.py`. Never commit it (it is in `.gitignore`).
 
 ## Logs (read by the dashboard)
 

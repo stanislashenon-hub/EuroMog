@@ -192,30 +192,36 @@ with st.form("qa"):
 if asked and q:
     context = {"live_status": status, "recent_investigations": [e["conclusion"] for e in investigations[-5:]],
                "tickets": list(tickets.values())[-10:], "verifications": verifications[-5:]}
-    answer = None
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        for path in (os.path.join(HERE, ".env"),):
-            if os.path.exists(path):
-                for line in open(path):
-                    if line.startswith("ANTHROPIC_API_KEY="):
-                        key = line.split("=", 1)[1].strip().strip('"')
-    if key:
-        try:
+    env = dict(os.environ)
+    if os.path.exists(os.path.join(HERE, ".env")):
+        for line in open(os.path.join(HERE, ".env")):
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.strip().split("=", 1)
+                env.setdefault(k.strip(), v.strip().strip('"'))
+    system = ("You are the maintenance agent of a rotating machine. Answer the technician in 2-4 "
+              "plain sentences, citing the numbers in the context. If the data does not answer "
+              "the question, say what you would need to measure.")
+    prompt = "Context: %s\n\nQuestion: %s" % (json.dumps(context, default=str), q)
+    gkey = env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY")
+    akey = env.get("ANTHROPIC_API_KEY")
+    try:
+        if gkey:
+            from google import genai
+            from google.genai import types
+            r = genai.Client(api_key=gkey).models.generate_content(
+                model=env.get("GEMINI_MODEL", "gemini-2.5-flash"), contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=system, temperature=0.2))
+            answer = r.text
+        elif akey:
             import anthropic
-            msg = anthropic.Anthropic(api_key=key, timeout=30.0).messages.create(
-                model="claude-sonnet-5-5", max_tokens=500,
-                system="You are the maintenance agent of a rotating machine. Answer the technician "
-                       "in 2-4 plain sentences, citing the numbers in the context. If the data "
-                       "does not answer the question, say what you would need to measure.",
-                messages=[{"role": "user", "content": "Context: %s\n\nQuestion: %s"
-                           % (json.dumps(context, default=str), q)}])
+            msg = anthropic.Anthropic(api_key=akey, timeout=30.0).messages.create(
+                model="claude-sonnet-5-5", max_tokens=500, system=system,
+                messages=[{"role": "user", "content": prompt}])
             answer = msg.content[0].text
-        except Exception as e:
-            answer = "Could not reach Claude (%s)." % e
-    else:
-        answer = "Set ANTHROPIC_API_KEY (in .env) to ask questions. Current status: %s." % (
-            status["status"] if status else "unknown")
+        else:
+            answer = "Add GEMINI_API_KEY or ANTHROPIC_API_KEY to .env to ask questions."
+    except Exception as e:
+        answer = "Could not reach the model (%s)." % e
     st.session_state["qa"] = (q, answer)
 if "qa" in st.session_state:
     st.markdown("**Q:** %s\n\n**A:** %s" % st.session_state["qa"])
