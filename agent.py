@@ -44,7 +44,9 @@ import json
 import os
 
 MODEL = "claude-sonnet-5-5"
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+# tried in order if the model above is refused (404): Google retires models for new keys
+GEMINI_FALLBACKS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3-flash", "gemini-2.5-flash"]
 MAX_ROUNDS = 10
 
 
@@ -278,15 +280,25 @@ def _gemini_call(body):
     """Plain HTTPS call to the Gemini API: no Google library, works on any Python 3."""
     import urllib.request
     import urllib.error
+    global GEMINI_MODEL
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % GEMINI_MODEL
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                 headers={"Content-Type": "application/json", "x-goog-api-key": key})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("Gemini HTTP %d: %s" % (e.code, e.read().decode()[:300]))
+    candidates = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]
+    last = None
+    for model in candidates:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "x-goog-api-key": key})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if model != GEMINI_MODEL:
+                    print("Gemini model %s refused, now using %s" % (GEMINI_MODEL, model))
+                    GEMINI_MODEL = model                  # remember the one that works
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            last = "Gemini HTTP %d (%s): %s" % (e.code, model, e.read().decode()[:300])
+            if e.code != 404:                             # only a missing model is worth retrying
+                raise RuntimeError(last)
+    raise RuntimeError(last)
 
 
 def _gemini_loop(system, user_payload, tools, finish_name, machine, log):

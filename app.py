@@ -215,7 +215,7 @@ if asked and q:
                     "generationConfig": {"temperature": 0.2}}
             req = urllib.request.Request(
                 "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
-                % env.get("GEMINI_MODEL", "gemini-2.5-flash"), data=json.dumps(body).encode(),
+                % env.get("GEMINI_MODEL", "gemini-3.8-flash"), data=json.dumps(body).encode(),
                 headers={"Content-Type": "application/json", "x-goog-api-key": gkey}, method="POST")
             with urllib.request.urlopen(req, timeout=60) as r:
                 data = json.loads(r.read().decode())

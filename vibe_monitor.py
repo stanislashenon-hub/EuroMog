@@ -69,7 +69,10 @@ BAUD = 500000
 FS = 1000                 # sample rate, Hz (must match the Arduino)
 WINDOW_S = 1.0            # FFT window length, s  -> resolution 1/WINDOW_S Hz
 N = int(FS * WINDOW_S)
-F_MIN, F_MAX = 5, 200     # where we look for the rotation peak, Hz
+# where we look for the rotation peak, Hz. The real motor turns at 38-60 Hz (sweep,
+# 15:10): searching up to 200 Hz locks onto its 3rd harmonic (~160 Hz) instead.
+F_MIN, F_MAX = (5, 200) if SOURCE == "sim" else (30, 80)
+F_PLOT = 200              # x-axis of the spectrum plot
 
 START_DUTY = 106 if SOURCE == "sim" else 200   # real motor stalls below ~150 (sweep 15:10)
 MIN_DUTY = 40 if SOURCE == "sim" else 150      # agent may not go below this
@@ -599,7 +602,7 @@ ax_t.set_xlabel("time (s)")
 ax_t.set_ylabel("accel (g)")
 line_f, = ax_f.plot(freqs, np.zeros_like(freqs), lw=1, label="live")
 line_b, = ax_f.plot(freqs, np.zeros_like(freqs), lw=1, ls="--", color="gray", label="baseline")
-ax_f.set_xlim(0, F_MAX)
+ax_f.set_xlim(0, F_PLOT)
 ax_f.set_xlabel("frequency (Hz)")
 ax_f.set_ylabel("amplitude (g)")
 ax_f.legend(loc="upper right")
