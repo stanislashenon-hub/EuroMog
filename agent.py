@@ -261,47 +261,72 @@ def _gemini_schema(s):
     return s
 
 
-def _gemini_loop(system, user_payload, tools, finish_name, machine, log):
-    from google import genai
-    from google.genai import types
+def _gemini_rest_schema(s):
+    """JSON schema -> Gemini REST schema (upper-case types, no null branches)."""
+    s = _gemini_schema(s)
+
+    def up(x):
+        if isinstance(x, dict):
+            return {k: (v.upper() if k == "type" and isinstance(v, str) else up(v)) for k, v in x.items()}
+        if isinstance(x, list):
+            return [up(i) for i in x]
+        return x
+    return up(s)
+
+
+def _gemini_call(body):
+    """Plain HTTPS call to the Gemini API: no Google library, works on any Python 3."""
+    import urllib.request
+    import urllib.error
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    client = genai.Client(api_key=key)
+    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % GEMINI_MODEL
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "x-goog-api-key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("Gemini HTTP %d: %s" % (e.code, e.read().decode()[:300]))
+
+
+def _gemini_loop(system, user_payload, tools, finish_name, machine, log):
     decls = []
     for t in tools:
-        params = _gemini_schema(t["input_schema"])
+        d = {"name": t["name"], "description": t["description"]}
+        params = _gemini_rest_schema(t["input_schema"])
         if params.get("properties"):
-            decls.append(types.FunctionDeclaration(name=t["name"], description=t["description"],
-                                                   parameters=params))
-        else:
-            decls.append(types.FunctionDeclaration(name=t["name"], description=t["description"]))
-    config = types.GenerateContentConfig(
-        system_instruction=system,
-        tools=[types.Tool(function_declarations=decls)],
-        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        temperature=0.2)
-    contents = [types.Content(role="user", parts=[types.Part(text=json.dumps(user_payload, default=str))])]
+            d["parameters"] = params
+        decls.append(d)
+    contents = [{"role": "user", "parts": [{"text": json.dumps(user_payload, default=str)}]}]
     steps = []
     for _ in range(MAX_ROUNDS):
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
-        cand = resp.candidates[0].content
-        contents.append(cand)
-        calls = [p.function_call for p in (cand.parts or []) if getattr(p, "function_call", None)]
+        resp = _gemini_call({
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": contents,
+            "tools": [{"functionDeclarations": decls}],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            "generationConfig": {"temperature": 0.2}})
+        cands = resp.get("candidates") or []
+        if not cands or "content" not in cands[0]:
+            raise RuntimeError("empty Gemini answer: %s" % json.dumps(resp)[:300])
+        content = cands[0]["content"]
+        contents.append(content)                      # kept verbatim (incl. thought signatures)
+        calls = [p["functionCall"] for p in content.get("parts", []) if "functionCall" in p]
         if not calls:
             raise RuntimeError("model answered without calling a tool")
         replies = []
         for fc in calls:
-            args = dict(fc.args or {})
-            if fc.name == finish_name:
-                out = json.loads(json.dumps(args, default=str))     # plain dicts/lists
+            name, args = fc["name"], fc.get("args") or {}
+            if name == finish_name:
+                out = dict(args)
                 out["steps"] = steps
                 return out
-            log("agent -> %s %s" % (fc.name, json.dumps(args, default=str)))
-            result = _run_tool(fc.name, args, machine)
-            steps.append({"tool": fc.name, "input": args, "result": result})
-            replies.append(types.Part.from_function_response(
-                name=fc.name, response={"result": json.loads(json.dumps(result, default=str))}))
-        contents.append(types.Content(role="user", parts=replies))
+            log("agent -> %s %s" % (name, json.dumps(args, default=str)))
+            result = _run_tool(name, args, machine)
+            steps.append({"tool": name, "input": args, "result": result})
+            replies.append({"functionResponse": {
+                "name": name, "response": {"result": json.loads(json.dumps(result, default=str))}}})
+        contents.append({"role": "user", "parts": replies})
     raise RuntimeError("no conclusion after %d rounds" % MAX_ROUNDS)
 
 

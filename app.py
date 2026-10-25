@@ -206,12 +206,17 @@ if asked and q:
     akey = env.get("ANTHROPIC_API_KEY")
     try:
         if gkey:
-            from google import genai
-            from google.genai import types
-            r = genai.Client(api_key=gkey).models.generate_content(
-                model=env.get("GEMINI_MODEL", "gemini-2.5-flash"), contents=prompt,
-                config=types.GenerateContentConfig(system_instruction=system, temperature=0.2))
-            answer = r.text
+            import urllib.request
+            body = {"systemInstruction": {"parts": [{"text": system}]},
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.2}}
+            req = urllib.request.Request(
+                "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+                % env.get("GEMINI_MODEL", "gemini-2.5-flash"), data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", "x-goog-api-key": gkey}, method="POST")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.loads(r.read().decode())
+            answer = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
         elif akey:
             import anthropic
             msg = anthropic.Anthropic(api_key=akey, timeout=30.0).messages.create(

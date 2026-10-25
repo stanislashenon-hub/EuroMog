@@ -39,7 +39,7 @@ The model (Gemini or Claude, whichever key is in `.env`) does the reasoning (too
 ## Run
 
 ```bash
-pip install pyserial numpy scipy matplotlib anthropic google-genai streamlit
+pip install pyserial numpy scipy matplotlib streamlit   # anthropic only if you use Claude
 python3 vibe_monitor.py           # real rig if the Uno is plugged in (found automatically), else simulator
 python3 vibe_monitor.py --sim     # force the simulator
 ```
