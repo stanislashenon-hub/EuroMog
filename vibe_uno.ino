@@ -9,6 +9,7 @@
 //   All grounds connected together (Uno, L293D, motor battery -).
 //
 // Output, 1000 lines/s at 500000 baud:  ax,ay,az,rpm   (accel in milli-g)
+//   or ERR,<count> when the sensor had to be restarted (motor noise)
 // Input commands (send from laptop, end with newline):
 //   P<0-255>   set motor PWM duty, e.g. P150
 //   S          stop motor
@@ -21,6 +22,8 @@ const unsigned long PERIOD_US = 1000;     // 1 kHz sampling
 
 volatile unsigned long lastPulse = 0, period = 0;
 unsigned long nextSample;
+unsigned long recoveries = 0;             // sensor restarts caused by motor noise
+unsigned int sinceWake = 0;               // samples since the last wake command
 char cmd[8];
 uint8_t cmdLen = 0;
 
@@ -47,6 +50,25 @@ uint8_t mpuRead(uint8_t reg) {
   return Wire.available() ? Wire.read() : 0xFF;
 }
 
+void mpuInit() {
+  mpuWrite(0x6B, 0x00);                   // wake up
+  mpuWrite(0x1A, 0x01);                   // low-pass filter ~184 Hz, 1 kHz internal rate
+  mpuWrite(0x1C, 0x08);                   // accel range +/-4 g (8192 counts per g)
+}
+
+void recover() {
+  // motor noise disturbed the sensor: reset the bus, wake the MPU again
+  Wire.clearWireTimeoutFlag();
+  while (Wire.available()) Wire.read();
+  Wire.end();
+  Wire.begin();
+  Wire.setClock(400000);
+  Wire.setWireTimeout(3000, true);
+  mpuInit();
+  recoveries++;
+  Serial.print("ERR,"); Serial.println(recoveries);   // the laptop sees the sensor is failing
+}
+
 void setup() {
   Serial.begin(500000);
   Wire.begin();
@@ -56,9 +78,7 @@ void setup() {
     Serial.println("ERROR: MPU6050 not found - check VCC, GND, SDA->A4, SCL->A5");
     delay(1000);
   }
-  mpuWrite(0x6B, 0x00);                   // wake up
-  mpuWrite(0x1A, 0x01);                   // low-pass filter ~184 Hz, 1 kHz internal rate
-  mpuWrite(0x1C, 0x08);                   // accel range +/-4 g (8192 counts per g)
+  mpuInit();
 
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
@@ -95,13 +115,27 @@ void loop() {
 
   Wire.beginTransmission(MPU);
   Wire.write(0x3B);                       // ACCEL_XOUT_H
-  Wire.endTransmission(false);
-  if (Wire.requestFrom(MPU, (uint8_t)6) != 6) return;   // read failed: skip this sample
+  uint8_t err = Wire.endTransmission(false);
+  if (err != 0 || Wire.requestFrom(MPU, (uint8_t)6) != 6 || Wire.getWireTimeoutFlag()) {
+    recover();                            // read failed: restart the sensor, skip this sample
+    return;
+  }
   uint8_t b[6];
   for (uint8_t i = 0; i < 6; i++) b[i] = Wire.read();   // one at a time: byte order is guaranteed
   int16_t ax = (b[0] << 8) | b[1];
   int16_t ay = (b[2] << 8) | b[3];
   int16_t az = (b[4] << 8) | b[5];
+
+  // A power glitch from the motor can reset the MPU into sleep mode: it still answers,
+  // but returns all zeros. Gravity alone makes that impossible on a working sensor.
+  if (ax == 0 && ay == 0 && az == 0) {
+    recover();
+    return;
+  }
+  if (++sinceWake >= 500) {               // every 0.5 s, re-send the wake command (cheap insurance)
+    sinceWake = 0;
+    mpuWrite(0x6B, 0x00);
+  }
 
   noInterrupts();
   unsigned long p = period, t = lastPulse;

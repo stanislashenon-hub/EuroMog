@@ -41,8 +41,6 @@ ticket_tools.py (Elouan) next to it and call register_tool(schema, function).
 
 import json
 import os
-from ticket_tools import verify_repair, get_ticket_tool_schema
-
 
 MODEL = "claude-sonnet-5-5"
 MAX_ROUNDS = 8

@@ -48,8 +48,8 @@ WINDOW_S = 1.0            # FFT window length, s  -> resolution 1/WINDOW_S Hz
 N = int(FS * WINDOW_S)
 F_MIN, F_MAX = 5, 200     # where we look for the rotation peak, Hz
 
-START_DUTY = 106          # initial operator setpoint (sim: ~1500 RPM)
-MIN_DUTY = 40             # the agent may not go below this (it must shut down instead)
+START_DUTY = 106 if SOURCE == "sim" else 200   # real motor stalls below ~150 (sweep 15:10)
+MIN_DUTY = 40 if SOURCE == "sim" else 150      # agent may not go below this
 VIB_LIMIT = 2.0           # vibration (RMS / baseline RMS) to stay under
 ESTOP_RATIO = 8.0         # hard stop, nobody asked
 SETTLE_S = WINDOW_S + 0.8 # after a speed change: motor settles + FFT window refills
@@ -134,6 +134,8 @@ class SerialSource:
         self.buf = b""
         self.rpm = 0
         self.duty = 0
+        self.errors = 0                               # ERR lines: sensor restarts
+        self.last_data = time.time()
 
     def set_duty(self, duty):
         self.duty = int(max(0, min(255, duty)))
@@ -144,6 +146,9 @@ class SerialSource:
         *lines, self.buf = self.buf.split(b"\n")
         out = []
         for line in lines:
+            if line.startswith(b"ERR"):
+                self.errors += 1
+                continue
             try:
                 parts = line.decode().strip().split(",")
                 out.append(float(parts[2]) / 1000.0)  # milli-g -> g
@@ -151,6 +156,8 @@ class SerialSource:
                     self.rpm = float(parts[3])
             except (ValueError, IndexError, UnicodeDecodeError):
                 pass
+        if out:
+            self.last_data = time.time()
         return np.array(out)
 
 
@@ -232,6 +239,48 @@ baseline_spec = None
 
 def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+STATUS_FILE = os.path.join(LOG_DIR, "status.json")      # live snapshot for the dashboard
+COMMAND_FILE = os.path.join(LOG_DIR, "command.json")    # the dashboard writes requests here
+_last_status_write = [0.0]
+
+
+def write_status(feat, diag):
+    """Live snapshot for the dashboard (app.py), at most every 0.5 s."""
+    if time.time() - _last_status_write[0] < 0.5:
+        return
+    _last_status_write[0] = time.time()
+    snap = {"time": now_iso(), "source": SOURCE, "status": diag["status"],
+            "faults": diag["faults"], "mode": state["mode"], "duty": src.duty,
+            "setpoint": state["setpoint"], "rpm": round(feat["rpm"]),
+            "imbalance_ratio": diag["imbalance_ratio"], "looseness_ratio": diag["looseness_ratio"],
+            "vibration_ratio": diag["vibration_ratio"], "baseline": baseline is not None,
+            "agent_busy": state["agent_busy"], "agent_line": state["agent_line"],
+            "latched": state["latched"], "open_ticket": state["open_ticket"],
+            "sensor_restarts": getattr(src, "errors", 0)}
+    tmp = STATUS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(snap, f)
+    os.replace(tmp, STATUS_FILE)                      # atomic: the dashboard never reads half a file
+
+
+def check_commands():
+    """Requests from the dashboard: {"cmd": "verify"} or {"cmd": "baseline"}."""
+    if not os.path.exists(COMMAND_FILE):
+        return
+    try:
+        cmd = json.load(open(COMMAND_FILE)).get("cmd")
+    except (ValueError, OSError):
+        cmd = None
+    try:
+        os.remove(COMMAND_FILE)
+    except OSError:
+        pass
+    if cmd in ("verify", "baseline"):
+        class _Key:                                   # reuse the keyboard handlers
+            key = "v" if cmd == "verify" else "b"
+        on_key(_Key())
 
 
 def log_event(kind, payload):
@@ -442,9 +491,15 @@ def update(_):
 
     safety_check(diag)
     maybe_investigate(feat, diag)
+    write_status(feat, diag)
+    check_commands()
 
+    stale = time.time() - getattr(src, "last_data", time.time()) > 0.5
     title = diag["status"]
-    if diag["faults"]:
+    if stale:
+        title = "NO SENSOR DATA (check MPU wires / power-cycle)"
+        diag = dict(diag, status="NO BASELINE")
+    if diag["faults"] and not stale:
         title += ": " + ", ".join(diag["faults"])
     if baseline is None:
         title += " (press b)"
@@ -455,6 +510,9 @@ def update(_):
         title += "   (press r to reset)"
     status.set_text(title)
     status.set_color(COLORS[diag["status"]])
+    if getattr(src, "errors", 0):
+        title += "   |   sensor restarts: %d" % src.errors
+        status.set_text(title)
 
     y = buf - buf.mean()
     line_t.set_ydata(y)
