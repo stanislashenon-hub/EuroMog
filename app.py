@@ -1,74 +1,183 @@
-import streamlit as st
+"""
+Cal Hacks 13.0 - Technician dashboard (Streamlit).
+
+Runs next to vibe_monitor.py and only reads/writes files in logs/:
+  logs/status.json     live snapshot written by the monitor every 0.5 s
+  logs/events.jsonl    alarms, the agent's investigations, verifications
+  logs/tickets.jsonl   tickets (a ticket is rewritten when it changes: last line per id wins)
+  logs/command.json    written here: {"cmd": "verify"} or {"cmd": "baseline"}; the monitor picks it up
+
+Run (in a second terminal, same folder as vibe_monitor.py):
+  pip install streamlit
+  streamlit run app.py
+"""
+
 import json
 import os
 import time
 
-st.set_page_config(page_title="Vibration Monitor Dashboard", layout="wide")
-st.title("Autonomous Vibration Monitor")
+import streamlit as st
 
-LOG_DIR = "logs"
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(HERE, "logs")
+STATUS_FILE = os.path.join(LOG_DIR, "status.json")
 EVENTS_FILE = os.path.join(LOG_DIR, "events.jsonl")
 TICKETS_FILE = os.path.join(LOG_DIR, "tickets.jsonl")
+COMMAND_FILE = os.path.join(LOG_DIR, "command.json")
+REFRESH_S = 2
 
-def load_jsonl(filepath):
-    """Safely loads lines of JSON from a log file."""
-    data = []
-    if os.path.exists(filepath):
-        with open(filepath, "r") as f:
+st.set_page_config(page_title="Vibration Monitor", layout="wide")
+
+
+def load_jsonl(path):
+    out = []
+    if os.path.exists(path):
+        with open(path) as f:
             for line in f:
-                if line.strip():
-                    data.append(json.loads(line))
-    return data
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        pass                      # line being written right now
+    return out
 
-# Load the live data
+
+def load_status():
+    try:
+        with open(STATUS_FILE) as f:
+            s = json.load(f)
+        s["_age"] = time.time() - os.path.getmtime(STATUS_FILE)
+        return s
+    except (OSError, ValueError):
+        return None
+
+
+def send_command(cmd):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(COMMAND_FILE, "w") as f:
+        json.dump({"cmd": cmd, "time": time.time()}, f)
+
+
+status = load_status()
 events = load_jsonl(EVENTS_FILE)
-tickets = load_jsonl(TICKETS_FILE)
+tickets = {}
+for t in load_jsonl(TICKETS_FILE):
+    if "id" in t:
+        tickets[t["id"]] = t                      # last line per id = current state
+investigations = [e for e in events if e.get("kind") == "investigation"]
+verifications = [e for e in events if e.get("kind") == "verification"]
 
-col1, col2 = st.columns(2)
+st.title("Autonomous Vibration Monitor")
 
-with col1:
-    st.subheader("Live System Status")
-    if events:
-        # Extract the latest status report
-        reports = [e for e in events if e.get("kind") == "report"]
-        if reports:
-            latest_report = reports[-1]["report"]
-            status_color = "red" if latest_report['status'] == "CRITICAL" else "orange" if latest_report['status'] == "WARNING" else "green"
-            st.markdown(f"**Machine Status:** :{status_color}[{latest_report['status']}]")
-            st.write(f"**Control Mode:** {latest_report['mode'].upper()}")
-            st.write(f"**Speed:** {latest_report['rpm']} RPM")
-            st.write(f"**Detected Faults:** {', '.join(latest_report['faults']) if latest_report['faults'] else 'None'}")
-            
-        # Extract the agent's latest action and reasoning
-        actions = [e for e in events if e.get("kind") == "action"]
-        if actions:
-            latest_action = actions[-1]["action"]
-            st.info(f"**Agent Reasoning:** {latest_action.get('reason', 'Running normally.')}")
-    else:
-        st.write("Awaiting telemetry data...")
+# ---------------- live status ----------------
+if status is None:
+    st.warning("Waiting for the monitor... start it with "
+               "`python3 vibe_monitor.py --serial <port>` in the same folder.")
+elif status["_age"] > 5:
+    st.warning("The monitor is not running (last update %.0f s ago)." % status["_age"])
 
-with col2:
-    st.subheader("Maintenance Tickets")
-    if tickets:
-        latest_ticket = tickets[-1]["ticket"]
-        st.error(f"**Active Ticket:** {latest_ticket['title']}")
-        st.write(f"**Severity:** {latest_ticket['severity'].upper()}")
-        st.write(f"**Evidence:** {latest_ticket['evidence']}")
-        st.write(f"**Recommended Action:** {latest_ticket['recommended_action']}")
-        
-        # Repair verification button
-        if st.button("🛠️ Repair Done (Verify Fix)", type="primary"):
-            st.success("Verification triggered! The agent is capturing a new baseline...")
-            # In a real environment, this would call your ticket_tools.verify_repair() 
-            # or send a flag to the main loop to press the 'v' key.
-            time.sleep(2) 
-    else:
-        st.success("No active maintenance tickets. Machine is healthy.")
+if status:
+    color = {"HEALTHY": "green", "WARNING": "orange", "CRITICAL": "red"}.get(status["status"], "gray")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown("### :%s[%s]" % (color, status["status"]))
+    c1.caption(", ".join(status["faults"]) or "no fault")
+    c2.metric("Speed", "%d RPM" % status["rpm"], "duty %d / %d" % (status["duty"], status["setpoint"]),
+              delta_color="off")
+    c3.metric("Vibration vs baseline", "x%.1f" % status["vibration_ratio"])
+    c4.metric("Mode", status["mode"].upper())
+    if status["agent_busy"]:
+        st.info("**Agent working:** " + (status["agent_line"] or "investigating..."))
+    elif status["agent_line"]:
+        st.caption("Agent: " + status["agent_line"])
+    if status["latched"]:
+        st.error("Machine shut down. A person must reset it (key r in the monitor).")
+    if not status["baseline"]:
+        st.warning("No healthy baseline yet.")
+        if st.button("Capture baseline (machine healthy, motor running)"):
+            send_command("baseline")
+            st.success("Baseline requested.")
+
+st.divider()
+left, right = st.columns(2)
+
+# ---------------- tickets ----------------
+with left:
+    st.subheader("Maintenance tickets")
+    open_t = [t for t in tickets.values() if t.get("status") == "open"]
+    closed_t = [t for t in tickets.values() if t.get("status") == "closed"]
+    if not open_t:
+        st.success("No open ticket.")
+    for t in open_t:
+        st.error("**%s** · %s · severity %s" % (t["id"], t["title"], t["severity"].upper()))
+        st.write("**Evidence:** " + t["evidence"])
+        st.write("**What the agent did:** " + t["action_taken"])
+        st.write("**What to do:** " + t["recommended_action"])
+        if t.get("verification_failed"):
+            st.warning("Last repair check failed: " + t["verification_failed"])
+        if st.button("Repair done: verify %s" % t["id"], type="primary", key="v_" + t["id"]):
+            send_command("verify")
+            st.success("Verification requested: the agent is re-testing the machine.")
+    if closed_t:
+        with st.expander("Closed tickets (%d)" % len(closed_t)):
+            for t in reversed(closed_t):
+                st.write("**%s** %s, closed %s. %s" % (t["id"], t["title"], t.get("closed", ""),
+                                                       t.get("verification", "")))
+
+# ---------------- agent reasoning ----------------
+with right:
+    st.subheader("What the agent concluded")
+    if not investigations:
+        st.write("No alarm investigated yet.")
+    for e in reversed(investigations[-5:]):
+        c = e["conclusion"]
+        tech = "technician called" if c.get("needs_technician") else "no technician needed"
+        st.markdown("**%s** · %s · %s confidence · %s (%s)" % (
+            e["time"][11:19], c.get("diagnosis", "?").upper(), c.get("confidence", "?"), tech,
+            c.get("source", "")))
+        st.caption(c.get("evidence", ""))
+        with st.expander("Experiments the agent ran"):
+            for step in c.get("steps", []):
+                st.write("`%s` %s" % (step["tool"], json.dumps(step.get("input", {}))))
+                st.json(step.get("result"), expanded=False)
 
 st.divider()
 
-# Q&A Interface
-st.subheader("Operator Q&A")
-user_q = st.text_input("Ask the agent about the machine's history or current state...")
-if user_q:
-    st.write("*(Agent is querying logs...)*")
+# ---------------- operator Q&A ----------------
+st.subheader("Ask the agent")
+with st.form("qa"):
+    q = st.text_input("e.g. Can the machine keep running until 6 PM? Is this the same fault as before?")
+    asked = st.form_submit_button("Ask")
+if asked and q:
+    context = {"live_status": status, "recent_investigations": [e["conclusion"] for e in investigations[-5:]],
+               "tickets": list(tickets.values())[-10:], "verifications": verifications[-5:]}
+    answer = None
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        for path in (os.path.join(HERE, ".env"),):
+            if os.path.exists(path):
+                for line in open(path):
+                    if line.startswith("ANTHROPIC_API_KEY="):
+                        key = line.split("=", 1)[1].strip().strip('"')
+    if key:
+        try:
+            import anthropic
+            msg = anthropic.Anthropic(api_key=key, timeout=30.0).messages.create(
+                model="claude-sonnet-5-5", max_tokens=500,
+                system="You are the maintenance agent of a rotating machine. Answer the technician "
+                       "in 2-4 plain sentences, citing the numbers in the context. If the data "
+                       "does not answer the question, say what you would need to measure.",
+                messages=[{"role": "user", "content": "Context: %s\n\nQuestion: %s"
+                           % (json.dumps(context, default=str), q)}])
+            answer = msg.content[0].text
+        except Exception as e:
+            answer = "Could not reach Claude (%s)." % e
+    else:
+        answer = "Set ANTHROPIC_API_KEY (in .env) to ask questions. Current status: %s." % (
+            status["status"] if status else "unknown")
+    st.session_state["qa"] = (q, answer)
+if "qa" in st.session_state:
+    st.markdown("**Q:** %s\n\n**A:** %s" % st.session_state["qa"])
+
+time.sleep(REFRESH_S)
+st.rerun()
