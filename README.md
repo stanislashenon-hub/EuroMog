@@ -28,8 +28,8 @@ After the repair, the agent re-tests the machine, confirms the fix and closes th
 
 ```bash
 pip install pyserial numpy scipy matplotlib anthropic
-python3 vibe_monitor.py                                  # simulator, no hardware needed
-python3 vibe_monitor.py --serial /dev/cu.usbmodem14201   # real rig
+python3 vibe_monitor.py           # real rig if the Uno is plugged in (found automatically), else simulator
+python3 vibe_monitor.py --sim     # force the simulator
 ```
 
 Keys in the plot window: `b` baseline, `+`/`-` speed, `v` repair done (verify), `r` reset after shutdown. Simulator only: `i` imbalance, `l` looseness, `k` knock.

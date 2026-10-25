@@ -2,8 +2,9 @@
 Cal Hacks 13.0 - Vibration monitor: live FFT + diagnosis + investigating agent.
 
 Run:
-  python3 vibe_monitor.py                                  simulator
-  python3 vibe_monitor.py --serial /dev/cu.usbmodem14201   real rig (Uno)
+  python3 vibe_monitor.py                                  real rig if an Uno is plugged in, else simulator
+  python3 vibe_monitor.py --serial /dev/cu.usbmodem14201   force a specific port
+  python3 vibe_monitor.py --sim                            force the simulator
   add --no-agent to run without the agent
 
 Keys (click the plot window first):
@@ -35,13 +36,35 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--serial", metavar="PORT", help="Uno serial port (default: simulator)")
+ap.add_argument("--serial", metavar="PORT", help="Uno serial port (default: found automatically)")
+ap.add_argument("--sim", action="store_true", help="force the simulator even if an Uno is plugged in")
 ap.add_argument("--no-agent", action="store_true", help="monitor only")
 args, _ = ap.parse_known_args()
 
+
+def find_uno():
+    """First USB serial port that looks like an Arduino (macOS / Linux / Windows)."""
+    import glob
+    for pattern in ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*",
+                    "/dev/ttyACM*", "/dev/ttyUSB*"):
+        ports = sorted(glob.glob(pattern))
+        if ports:
+            return ports[0]
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            if "Arduino" in (p.description or "") or "CH340" in (p.description or ""):
+                return p.device
+    except ImportError:
+        pass
+    return None
+
+
 # ---------------- settings ----------------
-SOURCE = "serial" if args.serial else "sim"
-SERIAL_PORT = args.serial
+SERIAL_PORT = None if args.sim else (args.serial or find_uno())
+SOURCE = "serial" if SERIAL_PORT else "sim"
+print("Source: %s" % ("Uno on " + SERIAL_PORT if SERIAL_PORT else
+                      "SIMULATOR (no Uno found; plug it in or pass --serial PORT)"))
 BAUD = 500000
 FS = 1000                 # sample rate, Hz (must match the Arduino)
 WINDOW_S = 1.0            # FFT window length, s  -> resolution 1/WINDOW_S Hz
@@ -495,7 +518,7 @@ def update(_):
     check_commands()
 
     stale = time.time() - getattr(src, "last_data", time.time()) > 0.5
-    title = diag["status"]
+    title = ("[SIMULATOR]   " if SOURCE == "sim" else "") + diag["status"]
     if stale:
         title = "NO SENSOR DATA (check MPU wires / power-cycle)"
         diag = dict(diag, status="NO BASELINE")
